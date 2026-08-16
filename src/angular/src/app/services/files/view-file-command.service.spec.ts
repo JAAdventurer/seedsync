@@ -20,7 +20,9 @@ function makeModelFile(overrides: Partial<ModelFile> & { name: string }): ModelF
     state: ModelFileState.DEFAULT,
     downloading_speed: 0,
     eta: 0,
-    full_path: '/path/' + overrides.name,
+    // Matches the real backend invariant: a top-level ModelFile's full_path
+    // always equals its name.
+    full_path: overrides.name,
     is_extractable: false,
     local_created_timestamp: null,
     local_modified_timestamp: null,
@@ -42,7 +44,9 @@ function makeViewFile(overrides: Partial<ViewFile> & { name: string }): ViewFile
     status: ViewFileStatus.DEFAULT,
     downloadingSpeed: 0,
     eta: 0,
-    fullPath: '/path/' + overrides.name,
+    // Matches the real backend invariant: a top-level ViewFile's fullPath
+    // always equals its name.
+    fullPath: overrides.name,
     isArchive: false,
     isSelected: false,
     isChecked: false,
@@ -58,6 +62,7 @@ function makeViewFile(overrides: Partial<ViewFile> & { name: string }): ViewFile
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
     remoteModifiedTimestamp: null,
+    children: [],
     ...overrides,
   };
 }

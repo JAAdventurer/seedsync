@@ -156,24 +156,79 @@ the checklist. Each checklist item notes the exact file:line touched once done.
   full suite at once. Every module this branch actually touches was verified individually and
   passes cleanly.
 
-### Frontend
-- [ ] `models/config.ts`: `enable_nested_navigation` field + default
-- [ ] `pages/settings/options-list.ts`: checkbox entry
-- [ ] `models/view-file.ts`: `children: ViewFile[]`
-- [ ] `services/files/file-key.ts`: `parseFileKey`, shared `viewFileKey`
-- [ ] `services/files/model-file-tree.ts` (new): `resolveNestedModelFile`
-- [ ] `services/files/view-file.service.ts`: recursive `createViewFile`, fullPath-based key + resolver
-- [ ] `services/files/view-file-command.service.ts`: shared `viewFileKey`
-- [ ] `pages/files/file-list.component.ts`: fullPath trackBy, pass nested-nav-enabled flag down
-- [ ] `pages/files/file.component.ts`: expand/collapse state, recursive children input, pass-through outputs
-- [ ] `pages/files/file.component.html`: chevron + recursive `<app-file>` block
-- [ ] Angular tests: view-file.service, model-file-tree, file.component, options-list
+### Frontend — DONE
+- [x] `models/config.ts`: `enable_nested_navigation` field + default
+- [x] `pages/settings/options-list.ts`: checkbox entry in `OPTIONS_CONTEXT_OTHER` (no
+      `requiresRestart` — the backend reads the toggle live each cycle)
+- [x] `models/view-file.ts`: `children: ViewFile[]`
+- [x] `services/files/file-key.ts`: `parseFileKey`, shared `viewFileKey` (fullPath-based;
+      `viewFileKey`/`parseFileKey` deduped out of `view-file.service.ts` and
+      `view-file-command.service.ts`, which each used to define their own copy)
+- [x] `services/files/model-file-tree.ts` (new): `resolveNestedModelFile` — walks a
+      top-level `ModelFile`'s `.children` when a direct key lookup misses
+- [x] `services/files/view-file-tree-flatten.ts` (new): `flattenVisibleRows` — flattens
+      the top-level list + expanded children into a single display list for
+      `CdkFixedSizeVirtualScroll` (recursive rendering inside a row was ruled out: a
+      row that grows to contain its own nested subtree would violate the
+      fixed-item-size assumption and visually overlap the next virtual-scrolled row)
+- [x] `services/files/view-file.service.ts`: `createViewFile` recurses into
+      `modelFile.children`, forces `isExtractable`/`isValidatable` false for any
+      non-top-level row (nested EXTRACT/VALIDATE are a backend scope cut, so the UI
+      never offers a button that will always fail server-side); `viewFileKey`/resolver
+      now fullPath-based with nested fallback via `resolveNestedModelFile`;
+      `modelFilesEqual`/new `childrenEqual` extended to compare nested subtrees
+      recursively (**necessary fix, not scope creep** — without it a nested child's
+      state change wouldn't touch any of its root's own fields, so the diffing loop
+      would think the root was unchanged and never rebuild its ViewFile — nested rows
+      would silently display stale state forever)
+- [x] `services/files/view-file-command.service.ts`: shared `viewFileKey`
+- [x] `services/files/model-file.service.ts`: `commandUrl` now encodes `file.full_path`
+      instead of `file.name` (the one frontend change actually needed for nested
+      commands to reach the backend — no route/filter changes needed, see backend
+      section design decision #8)
+- [x] `pages/files/file-list.component.ts`: fullPath trackBy (via shared `viewFileKey`),
+      `expandedKeys` signal + `nestedNavEnabled$` (from `ConfigService.config$`) combined
+      into a `files: Observable<FlatViewFileRow[]>` via `flattenVisibleRows`;
+      `onToggleExpand` toggles a row's key in `expandedKeys`
+- [x] `pages/files/file.component.ts`/`.html`/`.scss`: `depth`/`hasChildren`/`isExpanded`
+      inputs, `toggleExpandEvent` output, indent (`marginLeft: depth * 24px`) + chevron
+      button rendered only when `hasChildren()`; checkbox hidden for `depth > 0` (nested
+      rows aren't part of the flat top-level list `setSelected`/`toggleCheck` operate on,
+      so making them checkable would silently no-op — simplest correct choice was to not
+      offer it)
+- [x] Angular tests added: `model-file-tree.spec.ts` (new, 6 tests), `view-file-tree-flatten.spec.ts`
+      (new, 5 tests), `file.component.spec.ts` (+7 tests: depth/hasChildren/isExpanded
+      inputs, toggleExpandEvent + stopPropagation, chevron render/dispatch, checkbox
+      hidden/shown by depth), `view-file.service.spec.ts` (+4 tests: recursive children
+      mapping, empty-children default, forced-false nested capabilities, top-level
+      capabilities untouched), `options-list.spec.ts` (+1 test), plus **existing spec
+      fixture fixes** (see below) and `file-list.component.spec.ts` (+1 new test: distinct
+      track keys for same-leaf-name nested vs top-level rows)
+
+**Fixture fix needed in 3 existing spec files**: `view-file.service.spec.ts` and
+`view-file-command.service.spec.ts` had `ModelFile`/`ViewFile` test fixtures defaulting
+`full_path`/`fullPath` to `"/path/" + name` — i.e. deliberately different from `name`.
+That's not realistic data (`ModelFile.full_path` always equals `name` for a real
+top-level file — the backend property returns `self.name` when `parent is None`), and
+once `viewFileKey`/diffing switched to being fullPath-based it broke the tests' implicit
+assumption that the two key spaces (name-keyed `ModelFileService`/`prevModelFiles` vs.
+fullPath-keyed `indices`/resolver) coincide for top-level rows. Fixed by changing the
+fixtures' default to `full_path: overrides.name` (matching the real invariant) — this
+is a test-data correction, not a production workaround. All other spec files with a
+similar `/path/` fixture pattern (`view-file-sort.service.spec.ts`,
+`model-file.service.spec.ts`, etc.) don't do key-based resolution and were unaffected.
 
 ### Verification
-- [ ] `ruff check --select C901 src/python` (complexity)
-- [ ] Python unit tests (see note on how they were run — Docker vs local)
-- [ ] `cd src/angular && npx ng lint`
-- [ ] `cd src/angular && npx ng test`
+- [x] `ruff check .` / `ruff check --select C901 .` / `ruff format --check .`: all clean
+- [x] Python tests: see backend section above for the module-by-module results and the
+      note on why the full `tests/unittests` suite wasn't run in one shot in this
+      sandbox (pre-existing multiprocessing-test flakiness, unrelated to this branch)
+- [x] `cd src/angular && npx ng lint`: **all files pass linting**
+- [x] `cd src/angular && npx ng test --watch=false`: **44 test files, 595 tests, all passing**
+      (up from the pre-branch baseline of 573 tests in 42 files — 22 new tests added,
+      0 removed, 0 skipped)
+- Node: this sandbox's default `node`/`npm` on PATH is v10.24.1 (too old for Angular 22);
+  used `/home/jaa/.nvm/versions/node/v22.23.2/bin` explicitly for `npm install`/`ng lint`/`ng test`.
 
 ## Log
 
@@ -181,3 +236,25 @@ the checklist. Each checklist item notes the exact file:line touched once done.
   `origin/develop` @ `55519ff`. Design decisions above finalized after reading
   reseeded's `ab2e7aa` diff and the current (post-decomposition,
   multi-pair-aware) seedsync-new controller/model layers.
+- Backend implemented and committed (`23130e7`): config toggle, `ModelRegistry.resolve_full_path`,
+  `CommandPipeline` nested resolution + race guards + EXTRACT/VALIDATE rejection,
+  `ModelBuilder` nested status routing + finalize rollup, `ModelUpdater` active-scan
+  filtering. 63 new/updated Python tests across 6 files, all passing; ruff clean.
+  Web routing investigated and found to need zero changes (double-URL-encoding already
+  handles nested paths; proved by a pre-existing integration test).
+- Frontend implemented and committed: settings toggle, `ViewFile.children`, fullPath-based
+  row identity (`viewFileKey`/`resolveNestedModelFile`), `flattenVisibleRows` for
+  virtual-scroll-safe nested display, expand/collapse UI in `file.component`. 22 new
+  Angular tests + 3 existing-fixture corrections (unrealistic `full_path`/name mismatch
+  in test data, exposed by the fullPath-based key switch). `ng lint` clean, `ng test`
+  595/595 passing. Used Node 22 explicitly (`/home/jaa/.nvm/versions/node/v22.23.2/bin`)
+  since this sandbox's default `node` on PATH is v10.24.1.
+- **Feature complete.** Both backend and frontend checklists fully checked off. Known,
+  intentional scope cuts (documented above, not gaps): nested EXTRACT/VALIDATE
+  unsupported (top-level only), nested rows not selectable/checkable/bulk-actionable,
+  active-scan fast path stays top-level-only for nested downloads (picked up by the
+  regular recursive scan instead, at its normal interval).
+- Not done: did not push the branch or open a PR (per task instructions — left for
+  review). Did not run the full `tests/unittests` Python suite in one shot in this
+  sandbox (see Verification section) — every module this branch touches was verified
+  individually instead.

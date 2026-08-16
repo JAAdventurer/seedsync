@@ -33,6 +33,7 @@ function makeViewFile(overrides: Partial<ViewFile> = {}): ViewFile {
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
     remoteModifiedTimestamp: null,
+    children: [],
     ...overrides,
   };
 }
@@ -404,5 +405,82 @@ describe('FileComponent.clearActiveAction recycle guard (#540)', () => {
 
     component.clearActiveAction(fileA, FileAction.QUEUE); // stale callback for an older QUEUE
     expect(component.activeAction).toBe(FileAction.VALIDATE);
+  });
+});
+
+describe('FileComponent nested navigation expand/collapse', () => {
+  let fixture: ComponentFixture<FileComponent>;
+  let component: FileComponent;
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [FileComponent],
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(FileComponent);
+    fixture.componentRef.setInput('file', makeViewFile());
+    fixture.componentRef.setInput('options', of({ nameFilter: '', statusFilter: '' }));
+    component = fixture.componentInstance;
+  });
+
+  it('defaults depth/hasChildren/isExpanded to 0/false/false', () => {
+    fixture.detectChanges();
+    expect(component.depth()).toBe(0);
+    expect(component.hasChildren()).toBe(false);
+    expect(component.isExpanded()).toBe(false);
+  });
+
+  it('reflects depth/hasChildren/isExpanded inputs', () => {
+    fixture.componentRef.setInput('depth', 2);
+    fixture.componentRef.setInput('hasChildren', true);
+    fixture.componentRef.setInput('isExpanded', true);
+    fixture.detectChanges();
+
+    expect(component.depth()).toBe(2);
+    expect(component.hasChildren()).toBe(true);
+    expect(component.isExpanded()).toBe(true);
+  });
+
+  it('onToggleExpand emits the file and stops event propagation', () => {
+    fixture.detectChanges();
+    const file = makeViewFile({ name: 'Top' });
+    const spy = vi.spyOn(component.toggleExpandEvent, 'emit');
+    const event = new MouseEvent('click');
+    const stopSpy = vi.spyOn(event, 'stopPropagation');
+
+    component.onToggleExpand(event, file);
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledExactlyOnceWith(file);
+  });
+
+  it('does not render an expand toggle when hasChildren is false', () => {
+    fixture.detectChanges();
+    const button = fixture.nativeElement.querySelector('.expand-toggle');
+    expect(button).toBeNull();
+  });
+
+  it('renders an expand toggle that dispatches onToggleExpand when hasChildren is true', () => {
+    fixture.componentRef.setInput('hasChildren', true);
+    fixture.detectChanges();
+    const button: HTMLButtonElement = fixture.nativeElement.querySelector('.expand-toggle');
+    expect(button).not.toBeNull();
+
+    const spy = vi.spyOn(component.toggleExpandEvent, 'emit');
+    button.click();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not render the checkbox for a nested (depth > 0) row', () => {
+    fixture.componentRef.setInput('depth', 1);
+    fixture.detectChanges();
+    const checkbox = fixture.nativeElement.querySelector('.checkbox');
+    expect(checkbox).toBeNull();
+  });
+
+  it('renders the checkbox for a top-level (depth 0) row', () => {
+    fixture.detectChanges();
+    const checkbox = fixture.nativeElement.querySelector('.checkbox');
+    expect(checkbox).not.toBeNull();
   });
 });

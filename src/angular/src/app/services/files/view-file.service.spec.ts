@@ -22,7 +22,11 @@ function makeModelFile(
     state: ModelFileState.DEFAULT,
     downloading_speed: 0,
     eta: 0,
-    full_path: "/path/" + overrides.name,
+    // Matches the real backend invariant: a top-level ModelFile's full_path
+    // always equals its name (ModelFile.full_path returns self.name when
+    // parent is None). ViewFileService's diffing keys off fullPath, so tests
+    // must uphold this or the indices/prevModelFiles key spaces diverge.
+    full_path: overrides.name,
     is_extractable: false,
     local_created_timestamp: null,
     local_modified_timestamp: null,
@@ -625,6 +629,8 @@ describe("ViewFileService", () => {
 
     const fakeVf = {
       name: "nonexistent",
+      pairId: null,
+      fullPath: "nonexistent",
     } as ViewFile;
     let result: WebReaction | undefined;
     service.queue(fakeVf).subscribe((r) => (result = r));
@@ -1030,6 +1036,68 @@ describe("ViewFileService", () => {
       makeModelFile({ name: "a", remote_size: 200, local_size: 50, state: ModelFileState.DOWNLOADING }),
     ]);
     expect(latestFilteredFiles().map((f) => f.name)).toEqual(["a"]);
+  });
+
+  // --- Nested navigation: createViewFile's recursive children mapping ---
+
+  it("maps a top-level ModelFile's nested children recursively into ViewFile.children", () => {
+    const leaf = makeModelFile({ name: "leaf.txt", full_path: "Top/Sub/leaf.txt" });
+    const sub = makeModelFile({
+      name: "Sub", full_path: "Top/Sub", is_dir: true, children: [leaf],
+    });
+    const top = makeModelFile({
+      name: "Top", full_path: "Top", is_dir: true, children: [sub],
+    });
+    emitModelFiles([top]);
+
+    const files = latestFiles();
+    expect(files.length).toBe(1);
+    expect(files[0].children.length).toBe(1);
+    expect(files[0].children[0].name).toBe("Sub");
+    expect(files[0].children[0].fullPath).toBe("Top/Sub");
+    expect(files[0].children[0].children.length).toBe(1);
+    expect(files[0].children[0].children[0].name).toBe("leaf.txt");
+    expect(files[0].children[0].children[0].fullPath).toBe("Top/Sub/leaf.txt");
+  });
+
+  it("a top-level file with no children maps to an empty children array", () => {
+    emitModelFiles([makeModelFile({ name: "flat.txt" })]);
+
+    expect(latestFiles()[0].children).toEqual([]);
+  });
+
+  it("forces isExtractable/isValidatable false for nested children regardless of derived capabilities", () => {
+    // A state/size combo that would normally derive isExtractable/isValidatable
+    // true for a top-level file (Downloaded, local+remote sizes known).
+    const leaf = makeModelFile({
+      name: "leaf.rar",
+      full_path: "Top/leaf.rar",
+      state: ModelFileState.DOWNLOADED,
+      local_size: 100,
+      remote_size: 100,
+    });
+    const top = makeModelFile({
+      name: "Top", full_path: "Top", is_dir: true, children: [leaf],
+    });
+    emitModelFiles([top]);
+
+    const child = latestFiles()[0].children[0];
+    expect(child.isExtractable).toBe(false);
+    expect(child.isValidatable).toBe(false);
+    expect(child.validateTooltip).toBeNull();
+  });
+
+  it("does not force isExtractable/isValidatable false for the top-level row itself", () => {
+    const top = makeModelFile({
+      name: "Top.rar",
+      state: ModelFileState.DOWNLOADED,
+      local_size: 100,
+      remote_size: 100,
+    });
+    emitModelFiles([top]);
+
+    // Top-level capability derivation is untouched by the nested-only override.
+    expect(latestFiles()[0].isExtractable).toBe(true);
   });
 });
 

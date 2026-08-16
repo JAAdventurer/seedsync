@@ -38,6 +38,7 @@ function makeViewFile(overrides: Partial<ViewFile> = {}): ViewFile {
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
     remoteModifiedTimestamp: null,
+    children: [],
     ...overrides,
   };
 }

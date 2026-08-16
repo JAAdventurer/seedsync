@@ -30,6 +30,8 @@ export interface ViewFile {
   localModifiedTimestamp: Date | null;
   remoteCreatedTimestamp: Date | null;
   remoteModifiedTimestamp: Date | null;
+  /** Nested children, only populated/rendered when nested navigation is enabled. */
+  children: ViewFile[];
 }
 
 export enum ViewFileStatus {

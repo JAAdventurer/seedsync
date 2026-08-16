@@ -7,12 +7,8 @@ import { ModelFileService } from './model-file.service';
 import { WebReaction } from '../utils/rest.service';
 import { ModelFile } from '../../models/model-file';
 import { ViewFile } from '../../models/view-file';
-import { fileKey } from './file-key';
+import { viewFileKey } from './file-key';
 import { ViewFileSelectionService } from './view-file-selection.service';
-
-function viewFileKey(vf: ViewFile): string {
-  return fileKey(vf.pairId, vf.name);
-}
 
 /** Resolves a view-file key back to its backing {@link ModelFile}, or undefined. */
 export type ModelFileResolver = (key: string) => ModelFile | undefined;

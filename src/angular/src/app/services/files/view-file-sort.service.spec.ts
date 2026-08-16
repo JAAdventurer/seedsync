@@ -37,6 +37,7 @@ function makeViewFile(
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
     remoteModifiedTimestamp: null,
+    children: [],
     ...overrides,
   };
 }

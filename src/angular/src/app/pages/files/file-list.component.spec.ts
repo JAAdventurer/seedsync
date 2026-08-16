@@ -73,6 +73,7 @@ function makeViewFile(overrides: Partial<ViewFile> = {}): ViewFile {
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
     remoteModifiedTimestamp: null,
+    children: [],
     ...overrides,
   };
 }
@@ -509,14 +510,24 @@ describe('FileListComponent', () => {
 
   // --- Track-by function ---
 
-  it('should generate track key from pairId and name', () => {
-    const file = makeViewFile({ pairId: 'pair-x', name: 'movie.mkv' });
-    expect(FileListComponent.identify(0, file)).toBe(fileKey('pair-x', 'movie.mkv'));
+  it('should generate track key from pairId and fullPath', () => {
+    const file = makeViewFile({ pairId: 'pair-x', name: 'movie.mkv', fullPath: 'movie.mkv' });
+    const row = { file, depth: 0, hasChildren: false, isExpanded: false };
+    expect(FileListComponent.identify(0, row)).toBe(fileKey('pair-x', 'movie.mkv'));
   });
 
-  it('should generate track key with just name when pairId is null', () => {
-    const file = makeViewFile({ pairId: null, name: 'movie.mkv' });
-    expect(FileListComponent.identify(0, file)).toBe(fileKey(null, 'movie.mkv'));
+  it('should generate track key with just fullPath when pairId is null', () => {
+    const file = makeViewFile({ pairId: null, name: 'movie.mkv', fullPath: 'movie.mkv' });
+    const row = { file, depth: 0, hasChildren: false, isExpanded: false };
+    expect(FileListComponent.identify(0, row)).toBe(fileKey(null, 'movie.mkv'));
+  });
+
+  it('should generate a distinct track key for a nested row with the same leaf name', () => {
+    const topFile = makeViewFile({ pairId: null, name: 'movie.mkv', fullPath: 'movie.mkv' });
+    const nestedFile = makeViewFile({ pairId: null, name: 'movie.mkv', fullPath: 'TopDir/movie.mkv' });
+    const topRow = { file: topFile, depth: 0, hasChildren: false, isExpanded: false };
+    const nestedRow = { file: nestedFile, depth: 1, hasChildren: false, isExpanded: false };
+    expect(FileListComponent.identify(0, topRow)).not.toBe(FileListComponent.identify(1, nestedRow));
   });
 
   // --- Bulk response handling ---

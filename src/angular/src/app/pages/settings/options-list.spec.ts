@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getConfigValue, OPTIONS_CONTEXT_FTPS, IOption } from './options-list';
+import { getConfigValue, OPTIONS_CONTEXT_FTPS, OPTIONS_CONTEXT_OTHER, IOption } from './options-list';
 import { OptionType } from './option.component';
 import { Config, DEFAULT_CONFIG } from '../../models/config';
 
@@ -54,5 +54,16 @@ describe('OPTIONS_CONTEXT_FTPS options', () => {
     const verify = findFtpsOption('lftp', 'ftp_ssl_verify_certificate');
     expect(verify.type).toBe(OptionType.Checkbox);
     expect(verify.requiresRestart).toBe(true);
+  });
+});
+
+describe('OPTIONS_CONTEXT_OTHER options', () => {
+  it('renders nested navigation as a Checkbox not requiring restart', () => {
+    const option = OPTIONS_CONTEXT_OTHER.options.find(
+      (o) => o.valuePath[0] === 'controller' && o.valuePath[1] === 'enable_nested_navigation',
+    );
+    expect(option).toBeDefined();
+    expect(option!.type).toBe(OptionType.Checkbox);
+    expect(option!.requiresRestart).toBeFalsy();
   });
 });

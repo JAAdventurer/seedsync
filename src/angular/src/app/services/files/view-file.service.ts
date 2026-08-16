@@ -8,7 +8,8 @@ import { PathPairsService } from '../settings/path-pairs.service';
 import { WebReaction } from '../utils/rest.service';
 import { ModelFile } from '../../models/model-file';
 import { ViewFile } from '../../models/view-file';
-import { fileKey } from './file-key';
+import { viewFileKey } from './file-key';
+import { resolveNestedModelFile } from './model-file-tree';
 import { mapState, deriveCapabilities, LOCAL_ACTION_STATUSES } from './view-file-capabilities';
 import { ViewFileSelectionService } from './view-file-selection.service';
 import { ViewFileCommandService } from './view-file-command.service';
@@ -27,10 +28,6 @@ export const VIEW_FILE_COALESCE_MS = new InjectionToken<number>('VIEW_FILE_COALE
   providedIn: 'root',
   factory: () => 0,
 });
-
-function viewFileKey(vf: ViewFile): string {
-  return fileKey(vf.pairId, vf.name);
-}
 
 export type ViewFileFilterCriteria = (viewFile: ViewFile) => boolean;
 
@@ -56,7 +53,11 @@ export class ViewFileService {
   // Resolve a view-file key to its backing ModelFile from the diffing-owned
   // snapshot. Threaded into ViewFileCommandService so command dispatch keeps the
   // exact resolution semantics this service has always used (`prevModelFiles`).
-  private readonly resolveModelFile = (key: string): ModelFile | undefined => this.prevModelFiles.get(key);
+  // `prevModelFiles` is keyed by top-level name; a key that doesn't match
+  // directly is walked into the matching top-level entry's nested children
+  // (see resolveNestedModelFile) so nested rows resolve too.
+  private readonly resolveModelFile = (key: string): ModelFile | undefined =>
+    this.prevModelFiles.get(key) ?? resolveNestedModelFile(this.prevModelFiles, key);
 
   private filterCriteria: ViewFileFilterCriteria | null = null;
   private sortComparator: ViewFileComparator | null = null;
@@ -386,7 +387,7 @@ function modelFilesEqual(a: ModelFile, b: ModelFile): boolean {
     a.eta === b.eta &&
     a.full_path === b.full_path &&
     a.is_extractable === b.is_extractable &&
-    hasLocalOnlyContent(a) === hasLocalOnlyContent(b)
+    childrenEqual(a.children, b.children)
   );
 }
 
@@ -403,7 +404,30 @@ function hasLocalOnlyContent(modelFile: ModelFile): boolean {
   });
 }
 
-function createViewFile(modelFile: ModelFile, pairNameMap: Map<string, string>, isSelected = false): ViewFile {
+// A top-level ModelFile's equality must include its nested subtree: a nested
+// child's state change (e.g. DOWNLOADING -> DOWNLOADED) doesn't touch any of
+// the root's own fields, so without this the root would look unchanged and
+// buildViewFromModelFiles would never rebuild its ViewFile - nested rows would
+// display stale state. Matched by name rather than index/order since a
+// Python set union (backend's _all_children_names) doesn't guarantee a stable
+// iteration order across rebuilds.
+function childrenEqual(a: readonly ModelFile[], b: readonly ModelFile[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const byName = new Map(b.map((c) => [c.name, c]));
+  return a.every((childA) => {
+    const childB = byName.get(childA.name);
+    return childB !== undefined && modelFilesEqual(childA, childB);
+  });
+}
+
+function createViewFile(
+  modelFile: ModelFile,
+  pairNameMap: Map<string, string>,
+  isSelected = false,
+  isTopLevel = true,
+): ViewFile {
   const localSize = modelFile.local_size ?? 0;
   const remoteSize = modelFile.remote_size ?? 0;
   let percentDownloaded: number;
@@ -427,6 +451,17 @@ function createViewFile(modelFile: ModelFile, pairNameMap: Map<string, string>, 
     modelFile.remote_size !== null &&
     hasLocalOnlyContent(modelFile);
 
+  // Nested EXTRACT/VALIDATE are out of scope for this feature (they interact
+  // with the staging/move pipeline, which never had to account for nested
+  // paths) - the backend rejects them unconditionally, so don't offer them.
+  if (!isTopLevel) {
+    capabilities.isExtractable = false;
+    capabilities.isValidatable = false;
+    capabilities.validateTooltip = null;
+  }
+
+  const children = modelFile.children.map((child) => createViewFile(child, pairNameMap, false, false));
+
   return {
     name: modelFile.name,
     pairId: modelFile.pair_id,
@@ -448,5 +483,6 @@ function createViewFile(modelFile: ModelFile, pairNameMap: Map<string, string>, 
     localModifiedTimestamp: modelFile.local_modified_timestamp,
     remoteCreatedTimestamp: modelFile.remote_created_timestamp,
     remoteModifiedTimestamp: modelFile.remote_modified_timestamp,
+    children,
   };
 }
