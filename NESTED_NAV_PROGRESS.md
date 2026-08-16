@@ -61,13 +61,19 @@ the checklist. Each checklist item notes the exact file:line touched once done.
    full name). This is a correctness fix, not a toggle-gated behavior change.
    Nested downloads still get picked up by the regular recursive local scan,
    just with the slower interval.
-8. **Routing**: the 6 `/server/command/<action>/<file_name>` routes switch from
-   bottle's default `<file_name>` filter (single path segment, no `/`) to
-   `<file_name:path>` (same filter already used for the static-file route).
-   This is a superset of the old behavior (still matches plain top-level names)
-   and avoids needing `%2F`-encoding tricks for nested paths — the browser can
-   just send the real `/`. `_validate_filename` already accepted multi-segment
-   names (pre-existing, written ahead of this feature apparently).
+8. **Routing: no changes needed.** The 6 `/server/command/<action>/<file_name>`
+   routes keep bottle's default single-segment filter. The frontend already
+   sends `file_name` **double URL-encoded**
+   (`encodeURIComponent(encodeURIComponent(...))`, pre-existing in
+   `ModelFileService.commandUrl`), so a nested full_path's `/` is encoded away
+   before it ever reaches the raw URL — it never appears as a literal `/` in
+   the path segment. `_validate_filename` already accepted multi-segment names
+   (pre-existing, apparently written ahead of this feature), and an existing
+   integration test (`test_controller.py::test_queue`'s `"value/with/slashes"`
+   case) already proves nested-looking names round-trip correctly through the
+   existing route. (An earlier pass here explored switching to bottle's
+   `:path` filter; reverted once the double-encoding scheme was found to
+   already handle it with zero backend routing changes.)
 9. **Frontend identity**: `ViewFile`/`ModelFile` row identity across selection
    and command-dispatch services switches from `fileKey(pairId, name)` to
    `fileKey(pairId, fullPath)`. Safe/no-op for top-level files (`fullPath ==
@@ -94,15 +100,61 @@ the checklist. Each checklist item notes the exact file:line touched once done.
 
 ## Checklist
 
-### Backend
-- [ ] `common/config.py`: add `enable_nested_navigation` to `Config.Controller`
-- [ ] `seedsync.py`: default `config.controller.enable_nested_navigation = False`
-- [ ] `controller/model_registry.py`: `resolve_full_path()`
-- [ ] `controller/command_pipeline.py`: nested resolution + race guards + full_path threading + EXTRACT/VALIDATE nested rejection
-- [ ] `controller/model_updater.py`: filter nested names from active-scan fast path; propagate toggle to model_builder
-- [ ] `controller/model_builder.py`: nested status routing + `_finalize_nested_dir` + shared descendant-check helper
-- [ ] `web/web_app.py`: `<file_name:path>` for the 6 command routes
-- [ ] Python tests: config, model_registry, command_pipeline (race guards + toggle off/on + nested delete), model_builder, model_updater, web handler integration
+### Backend — DONE
+- [x] `common/config.py:346-360`: `enable_nested_navigation` PROP on `Config.Controller`
+- [x] `seedsync.py`: default `config.controller.enable_nested_navigation = False`
+- [x] `controller/model_registry.py`: `resolve_full_path()` (walks `.get_children()`, pair-aware)
+- [x] `controller/command_pipeline.py`: `_resolve_command_file` (toggle-gated fallback),
+      `_find_queue_conflict` (ancestor/descendant race guard), `_handle_queue`/`_handle_stop`
+      use `command.filename` (== `file.full_path` post-resolution) instead of `file.name`,
+      `_handle_stop` now checks `Lftp.kill()`'s existing bool return (was previously ignored —
+      a small correctness fix needed for nested STOP, harmless/no-op for top-level),
+      `_dispatch_command` rejects nested EXTRACT/VALIDATE unconditionally
+- [x] `controller/model_updater.py`: `_detect_lftp_completions` filters nested names out of
+      `active_downloading_file_names` unconditionally (correctness fix, not toggle-gated);
+      `set_nested_navigation_enabled` propagated to `model_builder` each cycle
+- [x] `controller/model_builder.py`: `build_model` splits lftp statuses top-level/nested when
+      enabled; `_build_children`/`_determine_child_state` route a nested status to its child;
+      `_finalize_nested_dir` rolls a nested dir job to Downloaded + estimates its ETA;
+      `_all_remote_descendants_downloaded` extracted and reused by both the new nested rollup
+      and the existing root rollup (`_check_root_downloaded`)
+- [x] **`web/handler/controller.py`: route change reverted.** Investigated using bottle's
+      `:path` filter to allow literal `/` in `file_name`, but the frontend already sends
+      `file_name` **double URL-encoded** (`ModelFileService.commandUrl`,
+      `encodeURIComponent(encodeURIComponent(...))`), so a nested full_path's `/` is encoded
+      away before it ever reaches the raw URL — the existing single-segment route filter
+      already matches nested paths correctly. An existing integration test
+      (`tests/integration/test_web/test_handler/test_controller.py::test_queue`, the
+      `"value/with/slashes"` case) already proves this path works and predates this branch.
+      No web_app/route changes were needed at all — reverted the exploratory change.
+      Only change: `model-file.service.ts`'s `commandUrl` now encodes `file.full_path`
+      instead of `file.name` (see frontend section).
+- [x] Python tests added: `test_config.py` (field), `test_model_registry.py` (6 new
+      `resolve_full_path` tests), `test_command_pipeline.py` (18 new tests: resolution
+      fallback, race guards, nested queue/stop/delete, EXTRACT/VALIDATE rejection, `step()`
+      end-to-end), `test_model_builder.py` (5 new tests: nested file/dir routing, finalize
+      rollup, incomplete-subtree, toggle-off regression guard), `test_model_updater.py`
+      (3 new tests: active-scan filtering, completion-tracking unaffected),
+      `tests/integration/test_web/test_handler/test_config.py` (1 new: toggle round-trips
+      through the real HTTP get/set endpoints)
+
+**Test run results** (local venv at `/tmp/nested_nav_venv`, not Docker — see note below):
+- `ruff check .` / `ruff check --select C901 .` / `ruff format --check .`: all clean.
+- Every file touched, run individually: `test_config.py` 34 passed,
+  `test_model_registry.py` 14 passed, `test_command_pipeline.py` 44 passed,
+  `test_model_builder.py` 76 passed, `test_model_updater.py` 16 passed, `test_seedsync.py`
+  26 passed, `tests/unittests/test_web` + `tests/integration` together: 280 passed, 50
+  skipped, only 2 failures — both pre-existing and unrelated (`test_extract.py`'s real-7z-binary
+  RAR5 extraction tests fail in this sandbox's 7z version, nothing to do with this branch).
+- **Full `tests/unittests` suite hangs/times out in this sandbox environment** — bisected to
+  `test_common/test_app_process.py` and `test_common/test_multiprocessing_logger.py` (real
+  `multiprocessing.Process`/timing-based tests that are flaky/slow under this sandbox's
+  process scheduling — confirmed pre-existing and unrelated: both files are untouched by this
+  branch and fail/flake identically on a scratch check). CLAUDE.md notes Python tests
+  normally run in Docker via CI; that wasn't available in this session, so tests were run in a
+  throwaway local venv (`python3 -m venv /tmp/nested_nav_venv`) module-by-module instead of the
+  full suite at once. Every module this branch actually touches was verified individually and
+  passes cleanly.
 
 ### Frontend
 - [ ] `models/config.ts`: `enable_nested_navigation` field + default
