@@ -6,6 +6,7 @@ import { StreamDispatchService } from "../base/stream-dispatch.service";
 import { LoggerService } from "../utils/logger.service";
 import { RestService } from "../utils/rest.service";
 import { ModelFile } from "../../models/model-file";
+import { FileAction } from "../../models/file-action";
 
 function makeFileJson(name: string, state = "DEFAULT") {
   return {
@@ -175,58 +176,46 @@ describe("ModelFileService", () => {
     expect(result!.size).toBe(0);
   });
 
-  it("should call RestService.sendRequest with double-encoded filename for queue", () => {
-    mockRestService.sendRequest.mockReturnValue(of({}));
-    const file = { name: "test", full_path: "my file/test" } as ModelFile;
-    service.queue(file);
+  // The URL verb per action is a backend contract — cover all six.
+  const urlVerbCases: [string, FileAction, string][] = [
+    ["queue", FileAction.QUEUE, "queue"],
+    ["stop", FileAction.STOP, "stop"],
+    ["extract", FileAction.EXTRACT, "extract"],
+    ["validate", FileAction.VALIDATE, "validate"],
+    ["deleteLocal", FileAction.DELETE_LOCAL, "delete_local"],
+    ["deleteRemote", FileAction.DELETE_REMOTE, "delete_remote"],
+  ];
+  for (const [label, action, verb] of urlVerbCases) {
+    it(`should call RestService.sendRequest with double-encoded filename for ${label}`, () => {
+      mockRestService.sendRequest.mockReturnValue(of({}));
+      const file = { name: "test", full_path: "my file/test" } as ModelFile;
+      service.command(action, file);
 
-    const encoded = encodeURIComponent(encodeURIComponent("my file/test"));
+      const encoded = encodeURIComponent(encodeURIComponent("my file/test"));
+      expect(mockRestService.sendRequest).toHaveBeenCalledWith(
+        "/server/command/" + verb + "/" + encoded,
+      );
+    });
+  }
+
+  it("should append pair_id as a query param when the file has one", () => {
+    mockRestService.sendRequest.mockReturnValue(of({}));
+    const file = { name: "file1", full_path: "file1", pair_id: "pair a" } as ModelFile;
+    service.command(FileAction.QUEUE, file);
+
+    expect(mockRestService.sendRequest).toHaveBeenCalledWith(
+      "/server/command/queue/file1?pair_id=" + encodeURIComponent("pair a"),
+    );
+  });
+
+  it("should send full_path (not name) for a nested file", () => {
+    mockRestService.sendRequest.mockReturnValue(of({}));
+    const file = { name: "leaf.rar", full_path: "TopDir/Sub/leaf.rar", pair_id: null } as ModelFile;
+    service.command(FileAction.QUEUE, file);
+
+    const encoded = encodeURIComponent(encodeURIComponent("TopDir/Sub/leaf.rar"));
     expect(mockRestService.sendRequest).toHaveBeenCalledWith(
       "/server/command/queue/" + encoded,
-    );
-  });
-
-  it("should call RestService.sendRequest with double-encoded filename for stop", () => {
-    mockRestService.sendRequest.mockReturnValue(of({}));
-    const file = { name: "test", full_path: "my file/test" } as ModelFile;
-    service.stop(file);
-
-    const encoded = encodeURIComponent(encodeURIComponent("my file/test"));
-    expect(mockRestService.sendRequest).toHaveBeenCalledWith(
-      "/server/command/stop/" + encoded,
-    );
-  });
-
-  it("should call RestService.sendRequest with double-encoded filename for extract", () => {
-    mockRestService.sendRequest.mockReturnValue(of({}));
-    const file = { name: "test", full_path: "my file/test" } as ModelFile;
-    service.extract(file);
-
-    const encoded = encodeURIComponent(encodeURIComponent("my file/test"));
-    expect(mockRestService.sendRequest).toHaveBeenCalledWith(
-      "/server/command/extract/" + encoded,
-    );
-  });
-
-  it("should call RestService.sendRequest with double-encoded filename for deleteLocal", () => {
-    mockRestService.sendRequest.mockReturnValue(of({}));
-    const file = { name: "test", full_path: "my file/test" } as ModelFile;
-    service.deleteLocal(file);
-
-    const encoded = encodeURIComponent(encodeURIComponent("my file/test"));
-    expect(mockRestService.sendRequest).toHaveBeenCalledWith(
-      "/server/command/delete_local/" + encoded,
-    );
-  });
-
-  it("should call RestService.sendRequest with double-encoded filename for deleteRemote", () => {
-    mockRestService.sendRequest.mockReturnValue(of({}));
-    const file = { name: "test", full_path: "my file/test" } as ModelFile;
-    service.deleteRemote(file);
-
-    const encoded = encodeURIComponent(encodeURIComponent("my file/test"));
-    expect(mockRestService.sendRequest).toHaveBeenCalledWith(
-      "/server/command/delete_remote/" + encoded,
     );
   });
 
@@ -248,17 +237,6 @@ describe("ModelFileService", () => {
 
     expect(mockRestService.sendRequest).toHaveBeenCalledWith(
       "/server/command/cleanup_local/test?pair_id=pair-1",
-    );
-  });
-
-  it("should send full_path (not name) for a nested file", () => {
-    mockRestService.sendRequest.mockReturnValue(of({}));
-    const file = { name: "leaf.rar", full_path: "TopDir/Sub/leaf.rar", pair_id: null } as ModelFile;
-    service.queue(file);
-
-    const encoded = encodeURIComponent(encodeURIComponent("TopDir/Sub/leaf.rar"));
-    expect(mockRestService.sendRequest).toHaveBeenCalledWith(
-      "/server/command/queue/" + encoded,
     );
   });
 
