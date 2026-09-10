@@ -27,7 +27,7 @@
                 [depth]="row.depth"
                 [hasChildren]="row.hasChildren"
                 [isExpanded]="row.isExpanded"
-                (click)="row.depth === 0 && onSelect(row.file)"
+                (click)="onSelect(row.file)"
                 (checkEvent)="onCheck($event)"
                 (toggleExpandEvent)="onToggleExpand($event)"
                 (actionEvent)="onAction($event)"

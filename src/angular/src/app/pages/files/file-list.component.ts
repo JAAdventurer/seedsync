@@ -81,7 +81,16 @@ export class FileListComponent implements AfterViewInit, OnDestroy {
     map(([files, expandedKeys, nestedNavEnabled]) => flattenVisibleRows(files, expandedKeys, nestedNavEnabled)),
   );
 
+  // Latest flattened, on-screen row keys (top-level + expanded nested rows),
+  // kept in sync so a shift-click range can span exactly what's visible,
+  // including nested rows - shiftCheck needs this synchronously at click time.
+  private latestVisibleKeys: string[] = [];
+
   constructor() {
+    this.files.pipe(takeUntilDestroyed()).subscribe((rows) => {
+      this.latestVisibleKeys = rows.map((row) => viewFileKey(row.file));
+    });
+
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
 
     this.mobileMediaQuery = window.matchMedia(MOBILE_FILE_LIST_QUERY);
@@ -219,7 +228,7 @@ export class FileListComponent implements AfterViewInit, OnDestroy {
 
   onCheck(event: {file: ViewFile, shiftKey: boolean}): void {
     if (event.shiftKey) {
-      this.viewFileService.shiftCheck(event.file);
+      this.viewFileService.shiftCheck(event.file, this.latestVisibleKeys);
     } else {
       this.viewFileService.toggleCheck(event.file);
     }

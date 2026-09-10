@@ -22,12 +22,14 @@ function makeViewFile(overrides: Partial<ViewFile> = {}): ViewFile {
     isArchive: false,
     isSelected: false,
     isChecked: false,
+    isIndeterminate: false,
     isQueueable: false,
     isStoppable: false,
     isExtractable: false,
     isLocallyDeletable: true,
     isRemotelyDeletable: true,
     isCleanupLocalable: true,
+    hasDownloadingDescendant: false,
     isValidatable: false,
     validateTooltip: null,
     localCreatedTimestamp: null,
@@ -161,6 +163,30 @@ describe('FileComponent.ngOnChanges', () => {
     });
 
     expect(component.activeAction).toBeNull();
+  });
+
+  it('should clear activeAction for STOP when hasDownloadingDescendant becomes false', () => {
+    component.activeAction = FileAction.STOP;
+    const oldFile = makeViewFile({ status: ViewFileStatus.DEFAULT, hasDownloadingDescendant: true });
+    const newFile = makeViewFile({ status: ViewFileStatus.DEFAULT, hasDownloadingDescendant: false });
+
+    component.ngOnChanges({
+      file: new SimpleChange(oldFile, newFile, false),
+    });
+
+    expect(component.activeAction).toBeNull();
+  });
+
+  it('should NOT clear activeAction for STOP when hasDownloadingDescendant stays true', () => {
+    component.activeAction = FileAction.STOP;
+    const oldFile = makeViewFile({ status: ViewFileStatus.DEFAULT, hasDownloadingDescendant: true });
+    const newFile = makeViewFile({ status: ViewFileStatus.DEFAULT, hasDownloadingDescendant: true });
+
+    component.ngOnChanges({
+      file: new SimpleChange(oldFile, newFile, false),
+    });
+
+    expect(component.activeAction).toBe(FileAction.STOP);
   });
 });
 
@@ -473,16 +499,137 @@ describe('FileComponent nested navigation expand/collapse', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
-  it('does not render the checkbox for a nested (depth > 0) row', () => {
+  it('renders the checkbox for a nested (depth > 0) row', () => {
     fixture.componentRef.setInput('depth', 1);
     fixture.detectChanges();
     const checkbox = fixture.nativeElement.querySelector('.checkbox');
-    expect(checkbox).toBeNull();
+    expect(checkbox).not.toBeNull();
   });
 
   it('renders the checkbox for a top-level (depth 0) row', () => {
     fixture.detectChanges();
     const checkbox = fixture.nativeElement.querySelector('.checkbox');
     expect(checkbox).not.toBeNull();
+  });
+
+  it('sets the checkbox input indeterminate when the file is indeterminate', () => {
+    fixture.componentRef.setInput('file', makeViewFile({ name: 'Top', isChecked: false, isIndeterminate: true }));
+    fixture.detectChanges();
+    const input: HTMLInputElement = fixture.nativeElement.querySelector('.checkbox input[type="checkbox"]');
+    expect(input.indeterminate).toBe(true);
+    expect(input.checked).toBe(false);
+  });
+
+  it('sets aria-checked to mixed when the file is indeterminate', () => {
+    fixture.componentRef.setInput('file', makeViewFile({ name: 'Top', isChecked: false, isIndeterminate: true }));
+    fixture.detectChanges();
+    const checkbox = fixture.nativeElement.querySelector('.checkbox');
+    expect(checkbox.getAttribute('aria-checked')).toBe('mixed');
+  });
+
+  it('does not set the checkbox input indeterminate when the file is not indeterminate', () => {
+    fixture.detectChanges();
+    const input: HTMLInputElement = fixture.nativeElement.querySelector('.checkbox input[type="checkbox"]');
+    expect(input.indeterminate).toBe(false);
+  });
+});
+
+describe('FileComponent nested downloading indicator', () => {
+  let fixture: ComponentFixture<FileComponent>;
+
+  function getStopButton(): HTMLButtonElement {
+    const buttons = Array.from(fixture.nativeElement.querySelectorAll('.actions button')) as HTMLButtonElement[];
+    return buttons.find((b) => b.querySelector('img[src="assets/icons/stop.svg"]') !== null)!;
+  }
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [FileComponent],
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(FileComponent);
+    fixture.componentRef.setInput('options', of({ nameFilter: '', statusFilter: '' }));
+  });
+
+  it('renders "Nested Files Downloading" status text, line-broken between "Files" and "Downloading", when hasDownloadingDescendant is true', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.DEFAULT, hasDownloadingDescendant: true, isStoppable: true,
+    }));
+    fixture.detectChanges();
+
+    const text = fixture.nativeElement.querySelector('.status .text');
+    expect(text.querySelector('br')).not.toBeNull();
+    // No separator text node at the <br> itself - textContent concatenates
+    // the two fragments directly.
+    expect(text.textContent.trim()).toBe('Nested FilesDownloading');
+  });
+
+  it('does not fall through to the capitalized status text when hasDownloadingDescendant is true', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.QUEUED, hasDownloadingDescendant: true, isStoppable: true,
+    }));
+    fixture.detectChanges();
+
+    const texts = Array.from(fixture.nativeElement.querySelectorAll('.status .text')) as HTMLElement[];
+    expect(texts.length).toBe(1);
+    expect(texts[0].textContent.trim()).toBe('Nested FilesDownloading');
+  });
+
+  it('renders the nested-downloading icon (not default-remote) when hasDownloadingDescendant is true', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.DEFAULT, remoteSize: 200, hasDownloadingDescendant: true, isStoppable: true,
+    }));
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('img.nested-downloading')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('img.default-remote')).toBeNull();
+  });
+
+  it('renders the default-remote icon (not nested-downloading) when hasDownloadingDescendant is false', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.DEFAULT, remoteSize: 200, hasDownloadingDescendant: false,
+    }));
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('img.default-remote')).not.toBeNull();
+    expect(fixture.nativeElement.querySelector('img.nested-downloading')).toBeNull();
+  });
+
+  it('renders the plain capitalized status text when hasDownloadingDescendant is false', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.DOWNLOADED, hasDownloadingDescendant: false,
+    }));
+    fixture.detectChanges();
+
+    const text = fixture.nativeElement.querySelector('.status .text');
+    expect(text.textContent.trim()).toBe('Downloaded');
+  });
+
+  it('renders "Stop Nested Downloads" on the Stop button when hasDownloadingDescendant is true', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.DEFAULT, hasDownloadingDescendant: true, isStoppable: true,
+    }));
+    fixture.detectChanges();
+
+    expect(getStopButton().textContent).toContain('Stop Nested Downloads');
+  });
+
+  it('renders plain "Stop" on the Stop button when hasDownloadingDescendant is false', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.DOWNLOADING, hasDownloadingDescendant: false, isStoppable: true,
+    }));
+    fixture.detectChanges();
+
+    expect(getStopButton().textContent).toContain('Stop');
+    expect(getStopButton().textContent).not.toContain('Stop Nested Downloads');
+  });
+
+  it('enables the Stop button when isStoppable is true via hasDownloadingDescendant', () => {
+    fixture.componentRef.setInput('file', makeViewFile({
+      status: ViewFileStatus.DEFAULT, hasDownloadingDescendant: true, isStoppable: true,
+    }));
+    fixture.detectChanges();
+
+    expect(getStopButton().disabled).toBe(false);
   });
 });

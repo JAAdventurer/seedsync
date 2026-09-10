@@ -112,6 +112,9 @@ export class FileComponent implements OnChanges, OnDestroy {
                    oldFile.isCleanupLocalable && !newFile.isCleanupLocalable) {
           this.activeAction = null;
           this.deleteConfirm.reset();
+        } else if (this.activeAction === FileAction.STOP &&
+                   oldFile.hasDownloadingDescendant && !newFile.hasDownloadingDescendant) {
+          this.activeAction = null;
         }
 
         if (!oldFile.isSelected && newFile.isSelected && this.fileElement &&

@@ -54,12 +54,14 @@ function makeViewFile(overrides: Partial<ViewFile> = {}): ViewFile {
     isArchive: false,
     isSelected: false,
     isChecked: false,
+    isIndeterminate: false,
     isQueueable: true,
     isStoppable: false,
     isExtractable: false,
     isLocallyDeletable: false,
     isRemotelyDeletable: true,
     isCleanupLocalable: false,
+    hasDownloadingDescendant: false,
     isValidatable: false,
     validateTooltip: null,
     localCreatedTimestamp: null,
@@ -333,7 +335,19 @@ describe('FileListComponent', () => {
     const file = makeViewFile({ name: 'check-me.txt' });
     component.onCheck({ file, shiftKey: true });
 
-    expect(mockViewFileService.shiftCheck).toHaveBeenCalledWith(file);
+    // Second arg is the component's latest flattened, on-screen row keys
+    // (empty here since filteredFilesSubject hasn't emitted any rows).
+    expect(mockViewFileService.shiftCheck).toHaveBeenCalledWith(file, []);
+  });
+
+  it('should pass the current flattened visible row keys to shiftCheck', () => {
+    const a = makeViewFile({ name: 'a.txt', fullPath: 'a.txt' });
+    const b = makeViewFile({ name: 'b.txt', fullPath: 'b.txt' });
+    filteredFilesSubject.next([a, b]);
+
+    component.onCheck({ file: b, shiftKey: true });
+
+    expect(mockViewFileService.shiftCheck).toHaveBeenCalledWith(b, ['a.txt', 'b.txt']);
   });
 
   // --- Individual file actions ---

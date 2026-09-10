@@ -105,6 +105,13 @@
     img.stopped {
         width: 30px;
     }
+    // Taller than the other status icons (cloud + arrow + folder stacked
+    // vertically) - fixed height/width keeps its 100:140 viewBox aspect
+    // ratio instead of the square default squashing it.
+    img.nested-downloading {
+        width: 32px;
+        height: 45px;
+    }
 
     .text {
         margin-top: 3px;
@@ -354,6 +361,7 @@
         img.extracted    { filter: $tint-green; }
         img.stopped      { filter: $tint-muted; }
         img.default-remote { filter: $tint-subtle; }
+        img.nested-downloading { filter: $tint-blue; }
         img.deleted      { filter: $tint-pink; }
         img.extracting   { filter: $tint-blue; }
         img.extract-failed { filter: $tint-red; }
