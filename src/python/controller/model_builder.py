@@ -12,6 +12,7 @@ from model import Model, ModelError, ModelFile, is_nested_name
 from system import SystemFile
 
 from .extract import Extract, ExtractStatus
+from .nested_persist import all_remote_descendants_done, apply_nested_persist_authority
 from .validate import ValidateStatus
 
 
@@ -40,6 +41,7 @@ class ModelBuilder:
         self.__validated_files: set[str] = set()
         self.__corrupt_files: set[str] = set()
         self.__move_failed_files: set[str] = set()
+        self.__staged_files: set[str] = set()
         self.__auto_delete_remote = False
         self.__cached_model: Model | None = None
         self.__smoothed_etas: dict[str, float] = {}
@@ -133,6 +135,13 @@ class ModelBuilder:
         if self.__move_failed_files != prev_move_failed_files:
             self.__cached_model = None
 
+    def set_staged_files(self, staged_files: set[str]):
+        prev_staged_files = self.__staged_files
+        self.__staged_files = staged_files
+        # Invalidate the cache
+        if self.__staged_files != prev_staged_files:
+            self.__cached_model = None
+
     def set_auto_delete_remote(self, enabled: bool):
         if self.__auto_delete_remote != enabled:
             self.__auto_delete_remote = enabled
@@ -151,6 +160,7 @@ class ModelBuilder:
         self.__validated_files.clear()
         self.__corrupt_files.clear()
         self.__move_failed_files.clear()
+        self.__staged_files.clear()
         self.__auto_delete_remote = False
         self.__cached_model = None
         self.__smoothed_etas.clear()
@@ -232,6 +242,7 @@ class ModelBuilder:
             self._build_children(remote, local, status, model_file, nested_statuses, nested_dirs_to_finalize)
             for nested_dir in nested_dirs_to_finalize:
                 self._finalize_nested_dir(nested_dir)
+            apply_nested_persist_authority(model_file, self.__downloaded_files, self.__staged_files)
 
             self._estimate_eta(model_file, name, status)
             incomplete_children = self._check_root_downloaded(model_file)
@@ -362,22 +373,6 @@ class ModelBuilder:
             return ModelFile.State.QUEUED, child_transfer_state
         return ModelFile.State.DEFAULT, child_transfer_state
 
-    @staticmethod
-    def _all_remote_descendants_downloaded(model_file: ModelFile) -> bool:
-        """Check whether every remote descendant file (not dir) of model_file is Downloaded."""
-        frontier: deque[ModelFile] = deque()
-        frontier.extend(model_file.iter_children())
-        while frontier:
-            _child_file = frontier.popleft()
-            if (
-                not _child_file.is_dir
-                and _child_file.remote_size is not None
-                and _child_file.state != ModelFile.State.DOWNLOADED
-            ):
-                return False
-            frontier.extend(_child_file.iter_children())
-        return True
-
     def _finalize_nested_dir(self, dir_file: ModelFile) -> None:
         """Finalize a nested directory that has its own standalone lftp job.
 
@@ -401,7 +396,7 @@ class ModelBuilder:
         if (
             dir_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING)
             and dir_file.remote_size is not None
-            and ModelBuilder._all_remote_descendants_downloaded(dir_file)
+            and all_remote_descendants_done(dir_file)
         ):
             dir_file.state = ModelFile.State.DOWNLOADED
 
@@ -534,10 +529,11 @@ class ModelBuilder:
                 model_file.state = ModelFile.State.DOWNLOADED
             elif model_file.is_dir and model_file.remote_size is not None:
                 # root is a directory that also exists remotely - check all the children
-                if ModelBuilder._all_remote_descendants_downloaded(model_file):
-                    model_file.state = ModelFile.State.DOWNLOADED
-                else:
+                if not all_remote_descendants_done(model_file):
                     incomplete_children = True
+                elif model_file.local_size is not None:
+                    model_file.state = ModelFile.State.DOWNLOADED
+                # else every remote file was deleted locally: persist authority decides
         return incomplete_children
 
     def _determine_state(self, model_file: ModelFile, incomplete_children: bool):

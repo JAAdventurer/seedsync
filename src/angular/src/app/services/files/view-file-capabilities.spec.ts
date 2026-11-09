@@ -237,5 +237,13 @@ describe('view-file-capabilities', () => {
       const nested = { ...base, isTopLevel: false };
       expect(deriveCapabilities(ViewFileStatus.DEFAULT, 0, 100, 0, 100, nested).isQueueable).toBe(true);
     });
+
+    it('offers queue and remote delete, but not local delete, for a nested DELETED row', () => {
+      const nested = { ...base, isTopLevel: false };
+      const caps = deriveCapabilities(ViewFileStatus.DELETED, 0, 100, 0, 100, nested);
+      expect(caps.isQueueable).toBe(true);
+      expect(caps.isRemotelyDeletable).toBe(true);
+      expect(caps.isLocallyDeletable).toBe(false);
+    });
   });
 });

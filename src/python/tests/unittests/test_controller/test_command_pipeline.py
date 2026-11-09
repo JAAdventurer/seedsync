@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from common import UnrecoverableError
 from controller.command_pipeline import CommandPipeline, _find_local_only_paths
 from controller.commands import MAX_CONCURRENT_COMMAND_PROCESSES, Command
+from controller.controller_persist import ControllerPersist
 from controller.persist_keys import persist_key
 from lftp import LftpError
 from model import ModelError, ModelFile
@@ -1213,6 +1214,106 @@ class TestCommandPipelineNestedNavigation(unittest.TestCase):
         self.assertTrue(result)
         mock_delete_cls.assert_called_once_with(local_path="/local", file_name="Top/leaf.rar")
 
+    @patch("controller.command_pipeline.DeleteLocalProcess")
+    def test_handle_delete_local_downloaded_nested_file_adds_persist_key(self, mock_delete_cls):
+        """A nested row only gets a persist key from its own job; record it on
+        delete so it reads DELETED, not DEFAULT, once it's gone locally."""
+        pc = self._make_pair_context("pair-1")
+        pc.local_path = "/local"
+        pipeline = self._make_pipeline([pc], nested_enabled=True)
+        pipeline._context.config.controller.use_staging = False
+        pipeline._persist.downloaded_file_names = set()
+
+        root = ModelFile("Top", True)
+        leaf = ModelFile("leaf.rar", False)
+        leaf.state = ModelFile.State.DOWNLOADED
+        leaf.local_size = 100
+        leaf.remote_size = 100
+        root.add_child(leaf)
+        command = Command(Command.Action.DELETE_LOCAL, "Top/leaf.rar", pair_id="pair-1")
+        calls, notify = self._make_notify()
+
+        result = pipeline._handle_delete_local(command, leaf, pc, [], notify)
+
+        self.assertTrue(result)
+        self.assertIn(persist_key("pair-1", "Top/leaf.rar"), pipeline._persist.downloaded_file_names)
+        pipeline.sync_persist_callback.assert_called_once()
+
+    @patch("controller.command_pipeline.DeleteLocalProcess")
+    def test_handle_delete_local_completed_nested_dir_adds_persist_key(self, mock_delete_cls):
+        pc = self._make_pair_context("pair-1")
+        pc.local_path = "/local"
+        pipeline = self._make_pipeline([pc], nested_enabled=True)
+        pipeline._context.config.controller.use_staging = False
+        pipeline._persist.downloaded_file_names = set()
+
+        root = ModelFile("Top", True)
+        sub = ModelFile("Sub", True)
+        sub.state = ModelFile.State.DEFAULT
+        sub.local_size = 100
+        sub.remote_size = 100
+        leaf = ModelFile("leaf.rar", False)
+        leaf.state = ModelFile.State.DOWNLOADED
+        leaf.local_size = 100
+        leaf.remote_size = 100
+        sub.add_child(leaf)
+        root.add_child(sub)
+        command = Command(Command.Action.DELETE_LOCAL, "Top/Sub", pair_id="pair-1")
+        calls, notify = self._make_notify()
+
+        result = pipeline._handle_delete_local(command, sub, pc, [], notify)
+
+        self.assertTrue(result)
+        self.assertIn(persist_key("pair-1", "Top/Sub"), pipeline._persist.downloaded_file_names)
+        pipeline.sync_persist_callback.assert_called_once()
+
+    @patch("controller.command_pipeline.DeleteLocalProcess")
+    def test_handle_delete_local_partial_nested_file_adds_no_persist_key(self, mock_delete_cls):
+        """A partial file (Default, local < remote) does not read Downloaded
+        for the delete-key check, so no key is recorded."""
+        pc = self._make_pair_context("pair-1")
+        pc.local_path = "/local"
+        pipeline = self._make_pipeline([pc], nested_enabled=True)
+        pipeline._context.config.controller.use_staging = False
+        pipeline._persist.downloaded_file_names = set()
+
+        root = ModelFile("Top", True)
+        leaf = ModelFile("leaf.rar", False)
+        leaf.state = ModelFile.State.DEFAULT
+        leaf.local_size = 50
+        leaf.remote_size = 100
+        root.add_child(leaf)
+        command = Command(Command.Action.DELETE_LOCAL, "Top/leaf.rar", pair_id="pair-1")
+        calls, notify = self._make_notify()
+
+        result = pipeline._handle_delete_local(command, leaf, pc, [], notify)
+
+        self.assertTrue(result)
+        self.assertEqual(set(), pipeline._persist.downloaded_file_names)
+
+    @patch("controller.command_pipeline.DeleteLocalProcess")
+    def test_handle_delete_local_top_level_downloaded_row_adds_no_persist_key(self, mock_delete_cls):
+        """Top-level rows already get their persist key from the regular
+        downloaded-files flow; the nested-specific recording only applies to
+        rows with a parent."""
+        pc = self._make_pair_context("pair-1")
+        pc.local_path = "/local"
+        pipeline = self._make_pipeline([pc], nested_enabled=True)
+        pipeline._context.config.controller.use_staging = False
+        pipeline._persist.downloaded_file_names = set()
+
+        top = ModelFile("Top", False)
+        top.state = ModelFile.State.DOWNLOADED
+        top.local_size = 100
+        top.remote_size = 100
+        command = Command(Command.Action.DELETE_LOCAL, "Top", pair_id="pair-1")
+        calls, notify = self._make_notify()
+
+        result = pipeline._handle_delete_local(command, top, pc, [], notify)
+
+        self.assertTrue(result)
+        self.assertEqual(set(), pipeline._persist.downloaded_file_names)
+
     @patch("controller.command_pipeline.DeleteRemoteProcess")
     def test_handle_delete_remote_nested_uses_full_path(self, mock_delete_cls):
         pc = self._make_pair_context("pair-1")
@@ -1444,6 +1545,7 @@ class TestCommandPipelineNestedNavigation(unittest.TestCase):
         pipeline._context.config.general.exclude_patterns = ""
         move_key = persist_key("pair-1", "Top/leaf.rar")
         pipeline.moved_file_keys.add(move_key)
+        pipeline._persist = ControllerPersist()
         pipeline._persist.move_failed_file_names = {move_key}
 
         root = ModelFile("Top", True)
@@ -1511,42 +1613,42 @@ class TestCommandPipelineNestedNavigation(unittest.TestCase):
         move_process.file_name = file_name
         return move_process
 
-    def test_find_overlapping_move_same_name(self):
+    def testfind_overlapping_move_same_name(self):
         pc = self._make_pair_context("pair-1")
         pipeline = self._make_pipeline([pc], nested_enabled=True)
         pipeline.active_move_processes.append(self._fake_move_process("pair-1", "Top/Sub"))
 
         self.assertEqual("Top/Sub", pipeline.find_overlapping_move("Top/Sub", pc))
 
-    def test_find_overlapping_move_ancestor_moving_blocks_descendant_queue(self):
+    def testfind_overlapping_move_ancestor_moving_blocks_descendant_queue(self):
         pc = self._make_pair_context("pair-1")
         pipeline = self._make_pipeline([pc], nested_enabled=True)
         pipeline.active_move_processes.append(self._fake_move_process("pair-1", "Top"))
 
         self.assertEqual("Top", pipeline.find_overlapping_move("Top/Sub/f.bin", pc))
 
-    def test_find_overlapping_move_descendant_moving_blocks_ancestor_queue(self):
+    def testfind_overlapping_move_descendant_moving_blocks_ancestor_queue(self):
         pc = self._make_pair_context("pair-1")
         pipeline = self._make_pipeline([pc], nested_enabled=True)
         pipeline.active_move_processes.append(self._fake_move_process("pair-1", "Top/Sub/f.bin"))
 
         self.assertEqual("Top/Sub/f.bin", pipeline.find_overlapping_move("Top", pc))
 
-    def test_find_overlapping_move_unrelated_name_no_overlap(self):
+    def testfind_overlapping_move_unrelated_name_no_overlap(self):
         pc = self._make_pair_context("pair-1")
         pipeline = self._make_pipeline([pc], nested_enabled=True)
         pipeline.active_move_processes.append(self._fake_move_process("pair-1", "Other"))
 
         self.assertIsNone(pipeline.find_overlapping_move("Top", pc))
 
-    def test_find_overlapping_move_different_pair_no_overlap(self):
+    def testfind_overlapping_move_different_pair_no_overlap(self):
         pc = self._make_pair_context("pair-1")
         pipeline = self._make_pipeline([pc], nested_enabled=True)
         pipeline.active_move_processes.append(self._fake_move_process("pair-2", "Top"))
 
         self.assertIsNone(pipeline.find_overlapping_move("Top", pc))
 
-    def test_find_overlapping_move_prefix_name_not_overlap(self):
+    def testfind_overlapping_move_prefix_name_not_overlap(self):
         """'Top' vs 'TopX' must not be treated as overlapping - a string
         prefix without the path separator is just a different, unrelated name."""
         pc = self._make_pair_context("pair-1")

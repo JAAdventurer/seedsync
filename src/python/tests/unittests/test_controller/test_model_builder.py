@@ -1974,6 +1974,22 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_move_failed_files({"a", "c"})
         self.assertTrue(self.model_builder.has_changes())
 
+    def test_rebuild_on_staged_files(self):
+        self.assertTrue(self.model_builder.has_changes())
+
+        # Initial set
+        self.model_builder.set_staged_files({"Top/a", "Top/b"})
+        self.model_builder.build_model()
+        self.assertFalse(self.model_builder.has_changes())
+
+        # Does not invalidate on same
+        self.model_builder.set_staged_files({"Top/a", "Top/b"})
+        self.assertFalse(self.model_builder.has_changes())
+
+        # Invalidate on different
+        self.model_builder.set_staged_files({"Top/a", "Top/c"})
+        self.assertTrue(self.model_builder.has_changes())
+
 
 class TestSharedLocalDeduplication(unittest.TestCase):
     """
@@ -2263,3 +2279,78 @@ class TestModelBuilderNestedNavigation(unittest.TestCase):
         self.assertEqual({"Top"}, model.get_file_names())
         leaf = next(c for c in model.get_file("Top").get_children() if c.name == "leaf.rar")
         self.assertEqual(ModelFile.State.DOWNLOADING, leaf.state)
+
+
+class TestModelBuilderNestedPersistAuthority(unittest.TestCase):
+    """apply_nested_persist_authority is wired in per-root, before
+    _check_root_downloaded; these pin the end-to-end rollup through
+    ModelBuilder rather than nested_persist's own unit tests."""
+
+    def setUp(self):
+        logger = logging.getLogger(TestModelBuilderNestedPersistAuthority.__name__)
+        logger.addHandler(logging.NullHandler())
+        self.model_builder = ModelBuilder()
+        self.model_builder.set_base_logger(logger)
+
+    def test_keyed_missing_nested_child_becomes_deleted_and_root_downloaded(self):
+        r_top = SystemFile("Top", 1000, True)
+        r_leaf1 = SystemFile("leaf1", 500, False)
+        r_leaf2 = SystemFile("leaf2", 500, False)
+        r_top.add_child(r_leaf1)
+        r_top.add_child(r_leaf2)
+
+        l_top = SystemFile("Top", 500, True)
+        l_leaf1 = SystemFile("leaf1", 500, False)
+        l_top.add_child(l_leaf1)
+        # leaf2 absent locally
+
+        self.model_builder.set_remote_files([r_top])
+        self.model_builder.set_local_files([l_top])
+        self.model_builder.set_downloaded_files({"Top/leaf2"})
+
+        model = self.model_builder.build_model()
+
+        top = model.get_file("Top")
+        leaf2 = next(c for c in top.get_children() if c.name == "leaf2")
+        self.assertEqual(ModelFile.State.DELETED, leaf2.state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, top.state)
+
+    def test_unkeyed_missing_nested_child_stays_default_and_root_default(self):
+        r_top = SystemFile("Top", 1000, True)
+        r_leaf1 = SystemFile("leaf1", 500, False)
+        r_leaf2 = SystemFile("leaf2", 500, False)
+        r_top.add_child(r_leaf1)
+        r_top.add_child(r_leaf2)
+
+        l_top = SystemFile("Top", 500, True)
+        l_leaf1 = SystemFile("leaf1", 500, False)
+        l_top.add_child(l_leaf1)
+        # leaf2 absent locally, and not in downloaded_file_names
+
+        self.model_builder.set_remote_files([r_top])
+        self.model_builder.set_local_files([l_top])
+
+        model = self.model_builder.build_model()
+
+        top = model.get_file("Top")
+        leaf2 = next(c for c in top.get_children() if c.name == "leaf2")
+        self.assertEqual(ModelFile.State.DEFAULT, leaf2.state)
+        self.assertEqual(ModelFile.State.DEFAULT, top.state)
+
+    def test_root_missing_locally_with_its_only_remote_file_keyed_becomes_deleted_when_root_also_keyed(self):
+        """The nested child's own key settles it to Deleted first, which makes
+        it count as 'done' for the root's rollup check - but a root with no
+        local copy at all doesn't become Downloaded from that alone (there's
+        nothing to call Downloaded). It only moves off Default because its own
+        key routes it through persist authority too."""
+        r_top = SystemFile("Top", 500, True)
+        r_leaf = SystemFile("leaf", 500, False)
+        r_top.add_child(r_leaf)
+
+        self.model_builder.set_remote_files([r_top])
+        # No local files at all - Top has no local presence.
+        self.model_builder.set_downloaded_files({"Top", "Top/leaf"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DELETED, model.get_file("Top").state)
