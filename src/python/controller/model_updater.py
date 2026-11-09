@@ -79,8 +79,10 @@ class ModelUpdater:
         # permanently-failing move (e.g. a full disk) does not re-spawn forever.
         # Held in memory only, so a restart grants a fresh budget.
         self._move_retry_counts: dict[str, int] = {}
-        # Nested downloads left in staging by a restart get their move once,
-        # on the first cycle with every scan in (see _recover_staged_nested).
+        # Nested downloads a restart left in staging: listed in staged_nested
+        # on the first cycle, then moved once every scan is in
+        # (see _remember_staged_nested / _recover_staged_nested).
+        self._staged_nested_remembered = False
         self._staged_nested_recovered = False
 
     def update(self) -> None:
@@ -96,6 +98,8 @@ class ModelUpdater:
         latest_validate_statuses = self._validate_process.worker.pop_latest_statuses()
         latest_validated_results = self._validate_process.pop_completed()
         latest_failed_validations = self._validate_process.pop_failed()
+
+        self._remember_staged_nested()
 
         # Process each pair context's scan results and LFTP status
         for pc in self._pair_contexts:
@@ -360,12 +364,16 @@ class ModelUpdater:
             self.sync_persist_to_all_builders()
 
     @staticmethod
+    def _in_staging(pc: PairContext, name: str) -> bool:
+        """True (staging on) if name is in the pair's staging dir."""
+        return pc.effective_local_path != pc.local_path and os.path.exists(os.path.join(pc.effective_local_path, name))
+
+    @staticmethod
     def _is_staged(pc: PairContext, name: str) -> bool:
         """True (staging on) if name is still in the pair's staging dir, or was
         just moved out of it and the local scan hasn't picked it up yet."""
-        return pc.effective_local_path != pc.local_path and (
-            os.path.exists(os.path.join(pc.effective_local_path, name))
-            or os.path.exists(os.path.join(pc.local_path, name))
+        return ModelUpdater._in_staging(pc, name) or (
+            pc.effective_local_path != pc.local_path and os.path.exists(os.path.join(pc.local_path, name))
         )
 
     def _staged_nested_names(self, pc: PairContext) -> set[str]:
@@ -377,6 +385,21 @@ class ModelUpdater:
             for name in self._persist_sync.names_for_pair(self._persist.downloaded_file_names, pc.pair_id)
             if is_nested_name(name) and self._is_staged(pc, name)
         }
+
+    def _remember_staged_nested(self) -> None:
+        """On the first cycle, list the nested downloads a restart left in
+        staging in pc.staged_nested.
+
+        Startup brings their top-level ancestor in as an ADDED DOWNLOADED diff
+        on that same cycle, and its move reads staged_nested to leave the
+        incomplete ones behind (CommandPipeline.spawn_move_process). That only
+        needs persist and the filesystem, so it doesn't wait for the scans.
+        """
+        if self._staged_nested_remembered:
+            return
+        self._staged_nested_remembered = True
+        for pc in self._pair_contexts:
+            pc.staged_nested.update(name for name in self._staged_nested_names(pc) if self._in_staging(pc, name))
 
     def _recover_staged_nested(self) -> None:
         """Move nested downloads a restart left in staging.
@@ -393,9 +416,8 @@ class ModelUpdater:
         self._staged_nested_recovered = True
         for pc in self._pair_contexts:
             for name in self._staged_nested_names(pc):
-                in_staging = os.path.exists(os.path.join(pc.effective_local_path, name))
                 # Skip one already moving, e.g. inside an ancestor's top-level move.
-                if not in_staging or self._pipeline.find_overlapping_move(name, pc):
+                if not self._in_staging(pc, name) or self._pipeline.find_overlapping_move(name, pc):
                     continue
                 try:
                     remote_size = self._registry.resolve_full_path(name, pair_id=pc.pair_id).remote_size

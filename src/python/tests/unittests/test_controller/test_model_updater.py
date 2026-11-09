@@ -1,11 +1,17 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import os
+import shutil
+import tempfile
 import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+from controller.command_pipeline import CommandPipeline
 from controller.controller_persist import ControllerPersist
 from controller.model_updater import ModelUpdater
+from controller.move import MoveProcess
+from controller.pair_context import PairContext
 from controller.persist_keys import KEY_SEP, persist_key
 from controller.scan.scanner_process import ScannerResult
 from lftp import LftpJobStatus
@@ -991,3 +997,95 @@ class TestRecoverStagedNested(unittest.TestCase):
             updater._recover_staged_nested()
 
         pipeline.spawn_move_process.assert_not_called()
+
+
+class TestRestartLeavesStoppedNestedPartialInStaging(unittest.TestCase):
+    """Restart with a stopped nested partial under a downloaded top-level dir:
+    startup brings Top in as an ADDED DOWNLOADED diff on the first cycle, and
+    its move must leave the partial in staging. _remember_staged_nested lists
+    the partial in pc.staged_nested before that diff is processed."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.staging = os.path.join(self.root, "staging")
+        self.local = os.path.join(self.root, "local")
+        os.makedirs(os.path.join(self.staging, "Top", "Sub"))
+        os.makedirs(self.local)
+        with open(os.path.join(self.staging, "Top", "a.bin"), "wb") as f:
+            f.write(b"x" * 10)
+        # Stopped partial: 4 of 10 bytes, under its final name (pget -c)
+        with open(os.path.join(self.staging, "Top", "Sub", "big.bin"), "wb") as f:
+            f.write(b"x" * 4)
+        self._processes = []
+
+    def tearDown(self):
+        for process in self._processes:
+            process.close_queues()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_top_level_move_after_restart_leaves_partial_in_staging(self):
+        pc = PairContext(
+            pair_id=None,
+            name="Default",
+            remote_path="/remote",
+            local_path=self.local,
+            effective_local_path=self.staging,
+            lftp=MagicMock(),
+            remote_scan_process=MagicMock(),
+            local_scan_process=MagicMock(),
+            active_scan_process=MagicMock(),
+            active_scanner=MagicMock(),
+            local_scanner=MagicMock(),
+            remote_scanner=MagicMock(),
+            model_builder=MagicMock(),
+        )
+        persist = ControllerPersist()
+        persist.downloaded_file_names = {"Top", "Top/Sub/big.bin"}
+        registry = MagicMock()
+        registry.resolve_full_path.return_value.remote_size = 10
+        context = MagicMock()
+        context.config.controller.use_staging = True
+        context.config.controller.staging_path = self.staging
+        context.config.validate.enabled = False
+        context.config.autoqueue.auto_extract = False
+        context.args.umask = None
+        pipeline = CommandPipeline(
+            pair_contexts=[pc],
+            registry=registry,
+            persist=persist,
+            context=context,
+            password=None,
+            mp_logger=MagicMock(),
+            extract_process=MagicMock(),
+            validate_process=MagicMock(),
+            logger=MagicMock(),
+            sync_persist_callback=MagicMock(),
+        )
+        updater = ModelUpdater(
+            pair_contexts=[pc],
+            persist=persist,
+            pipeline=pipeline,
+            registry=registry,
+            extract_process=MagicMock(),
+            validate_process=MagicMock(),
+            context=context,
+            password=None,
+            logger=MagicMock(),
+        )
+        top = ModelFile("Top", True)
+        top.state = ModelFile.State.DOWNLOADED
+        top.remote_size = 20
+
+        updater._remember_staged_nested()
+        with patch("controller.command_pipeline.MoveProcess") as move_cls:
+            updater._process_model_diffs([ModelDiff(ModelDiff.Change.ADDED, None, top)])
+
+        move_cls.assert_called_once()
+        process = MoveProcess(**move_cls.call_args.kwargs)
+        self._processes.append(process)
+        process.run_once()
+
+        self.assertTrue(os.path.exists(os.path.join(self.local, "Top", "a.bin")))
+        self.assertTrue(os.path.exists(os.path.join(self.staging, "Top", "Sub", "big.bin")))
+        self.assertFalse(os.path.exists(os.path.join(self.local, "Top", "Sub", "big.bin")))
+        self.assertEqual({"Top/Sub/big.bin"}, pc.staged_nested)
