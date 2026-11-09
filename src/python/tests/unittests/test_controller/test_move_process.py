@@ -462,6 +462,8 @@ class TestMoveProcess(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.dst_dir, "Top", "a.bin")))
         self.assertTrue(os.path.exists(os.path.join(self.src_dir, "Top", "Sub", "big.bin")))
         self.assertFalse(os.path.exists(os.path.join(self.dst_dir, "Top", "Sub", "big.bin")))
+        # Sub holds only the partial, so no empty Sub is created at the destination
+        self.assertFalse(os.path.exists(os.path.join(self.dst_dir, "Top", "Sub")))
 
     def test_top_level_move_moves_everything_when_nested_download_complete(self):
         """A nested download whose size has caught up to expected moves along
