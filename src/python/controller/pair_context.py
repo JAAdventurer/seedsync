@@ -54,6 +54,10 @@ class PairContext:
     # Nested names queued while staging is on, awaiting their staging->final
     # move once lftp no longer lists the job (see ModelUpdater._spawn_nested_moves)
     pending_nested_moves: set[str] = field(default_factory=set[str])
+    # Nested names queued while staging is on whose download still sits in
+    # staging (finished or not). A top-level move leaves the incomplete ones
+    # behind (see CommandPipeline.spawn_move_process).
+    staged_nested: set[str] = field(default_factory=set[str])
     remote_scan_received: bool = False
     local_scan_received: bool = False
 
