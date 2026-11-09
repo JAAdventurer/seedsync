@@ -2209,6 +2209,43 @@ class TestModelBuilderNestedNavigation(unittest.TestCase):
         sub = next(c for c in model.get_file("Top").get_children() if c.name == "Sub")
         self.assertEqual(ModelFile.State.DOWNLOADING, sub.state)
 
+    def test_nested_child_move_failed(self):
+        """A nested child whose staging->final move failed renders MOVE_FAILED
+        even though it sits in staging and never reaches a post-download local
+        state - unlike a root, there's no DOWNLOADED/EXTRACTED/etc. to require."""
+        r_top = SystemFile("Top", 2000, True)
+        r_sub = SystemFile("Sub", 1000, True)
+        r_leaf = SystemFile("f.bin", 1000, False)
+        r_sub.add_child(r_leaf)
+        r_top.add_child(r_sub)
+        self.model_builder.set_remote_files([r_top])
+        self.model_builder.set_move_failed_files({"Top/Sub/f.bin"})
+
+        model = self.model_builder.build_model()
+
+        sub = next(c for c in model.get_file("Top").get_children() if c.name == "Sub")
+        leaf = next(c for c in sub.get_children() if c.name == "f.bin")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, leaf.state)
+
+    def test_nested_child_move_failed_stays_downloading_with_active_job(self):
+        """An active standalone job on the same name overrides MOVE_FAILED -
+        e.g. a re-queue just restarted it."""
+        r_top = SystemFile("Top", 2000, True)
+        r_sub = SystemFile("Sub", 1000, True)
+        r_leaf = SystemFile("f.bin", 1000, False)
+        r_sub.add_child(r_leaf)
+        r_top.add_child(r_sub)
+        self.model_builder.set_remote_files([r_top])
+        self.model_builder.set_move_failed_files({"Top/Sub/f.bin"})
+        nested_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "Top/Sub/f.bin", "")
+        self.model_builder.set_lftp_statuses([nested_status])
+
+        model = self.model_builder.build_model()
+
+        sub = next(c for c in model.get_file("Top").get_children() if c.name == "Sub")
+        leaf = next(c for c in sub.get_children() if c.name == "f.bin")
+        self.assertEqual(ModelFile.State.DOWNLOADING, leaf.state)
+
     def test_nested_status_never_creates_a_phantom_top_level_entry(self):
         """A '/'-containing status name is always routed to its nested child,
         even with nested navigation off (e.g. a nested job still running

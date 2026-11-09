@@ -327,6 +327,30 @@ class ModelUpdater:
             for key in absent_keys:
                 self._move_retry_counts.pop(key, None)
             self.sync_persist_to_all_builders()
+        self._prune_absent_nested_move_failures()
+
+    def _prune_absent_nested_move_failures(self) -> None:
+        """Drop nested move_failed keys whose row is gone (remote and local).
+
+        Nested keys never reach downloaded_file_names, which drives the prune
+        above, so they need their own pass. Called once all scans are in.
+        """
+        absent_keys: set[str] = set()
+        for key in self._persist.move_failed_file_names:
+            for pc in self._pair_contexts:
+                bare_name = strip_persist_key(key, pc.pair_id)
+                if bare_name == key and pc.pair_id is not None:
+                    continue
+                if is_nested_name(bare_name):
+                    try:
+                        self._registry.resolve_full_path(bare_name, pair_id=pc.pair_id)
+                    except ModelError:
+                        absent_keys.add(key)
+                break
+        if absent_keys:
+            self._logger.info(f"Persist cleanup (nested move failures gone): {absent_keys}")
+            self._persist.move_failed_file_names.difference_update(absent_keys)
+            self.sync_persist_to_all_builders()
 
     def _process_extraction_failures(self, latest_failed_extractions: list[ExtractFailedResult]) -> None:
         """Process extraction failures -- mark as failed immediately."""
@@ -382,6 +406,11 @@ class ModelUpdater:
         move_failed_file_names that is not already moving, bounded by a per-file
         budget so a permanently-failing move does not re-spawn forever (#536).
         """
+        # A count outlives its failure when the key is cleared without a requeue
+        # diff (a nested re-queue, see CommandPipeline._handle_queue); drop it so
+        # a later failure starts a fresh budget.
+        for key in [k for k in self._move_retry_counts if k not in self._persist.move_failed_file_names]:
+            del self._move_retry_counts[key]
         cfg = self._context.config.controller
         if not (cfg.use_staging and cfg.staging_path):
             return
@@ -552,6 +581,26 @@ class ModelUpdater:
             # recursive local scan, just less often.
             pc.active_downloading_file_names = [name for name in current_downloading if not is_nested_name(name)]
             pc.prev_downloading_file_names = current_downloading
+            self._spawn_nested_moves(pc, {s.name for s in lftp_statuses})
+
+    def _spawn_nested_moves(self, pc: PairContext, lftp_job_names: set[str]) -> None:
+        """Move each nested job queued under staging from staging to local_path
+        once lftp no longer lists it.
+
+        Top-level moves start from the DOWNLOADED diff; nested rows have no
+        diffs, so they start here. Driven by the queue rather than a
+        running->gone transition, which a job finishing between two status
+        polls (a small file, or one already complete in staging) never shows.
+        The job ending doesn't mean it finished (a Stop ends it too), so the
+        move gets the row's remote size to check.
+        """
+        for name in pc.pending_nested_moves - lftp_job_names:
+            pc.pending_nested_moves.discard(name)
+            try:
+                expected_size = self._registry.resolve_full_path(name, pair_id=pc.pair_id).remote_size
+            except ModelError:
+                expected_size = None
+            self._pipeline.spawn_move_process(name, pc, expected_size=expected_size)
 
     def sync_persist_to_all_builders(self):
         """Push current persist state to all pair model builders, filtered by pair_id."""

@@ -38,6 +38,7 @@ class MoveProcess(AppOneShotProcess):
         file_name: str,
         pair_id: str | None = None,
         umask: int | None = None,
+        expected_size: int | None = None,
     ):
         super().__init__(name=self.__class__.__name__)
         self.__source_path = source_path
@@ -47,6 +48,10 @@ class MoveProcess(AppOneShotProcess):
         # When set, the moved tree is chmod'ed to 0666/0777 & ~umask here, in
         # this process, rather than on the controller thread (#811).
         self.__umask = umask
+        # Set for a nested job, whose move is triggered by its lftp job ending,
+        # which a Stop or an error also does. A smaller or unfinalized source
+        # was never completed, so it is left in staging for a re-queue to resume.
+        self.__expected_size = expected_size
         self.__failed_result_stream = PipeStream()
 
     @property
@@ -122,6 +127,12 @@ class MoveProcess(AppOneShotProcess):
             self._report_failure(f"Move failed: source does not exist: {src}")
             return
 
+        if self.__expected_size is not None and (
+            self._has_lftp_temp_files(src) or self._get_total_size(src) < self.__expected_size
+        ):
+            self.logger.info(f"Move skipped for {self.__file_name}: download incomplete, left in staging")
+            return
+
         # Defer while lftp is still finalizing the staging tree. lftp renames
         # "<name>.lftp" -> "<name>" on completion; copying (or renaming the
         # whole tree) while a rename is in flight races — copytree lists the
@@ -137,14 +148,15 @@ class MoveProcess(AppOneShotProcess):
 
         self.logger.info(f"Moving {src} -> {dst}")
 
-        # Ensure destination parent directory exists
-        os.makedirs(self.__dest_path, exist_ok=True)
+        # Ensure the destination's parent exists (several levels for a nested name)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
 
         # Try rename first (instant on same filesystem)
         try:
             os.rename(src, dst)
             self.logger.info(f"Move completed via rename: {self.__file_name}")
             self.__apply_modes(dst)
+            self.__prune_empty_staging_parents(src)
             return
         except OSError as e:
             if e.errno == errno.EXDEV:
@@ -190,10 +202,23 @@ class MoveProcess(AppOneShotProcess):
 
         self.logger.info(f"Move completed via copy+delete: {self.__file_name}")
         self.__apply_modes(dst)
+        self.__prune_empty_staging_parents(src)
 
     def __apply_modes(self, dst: str) -> None:
         if self.__umask is not None:
             apply_umask_modes(dst, self.__umask, self.logger)
+
+    def __prune_empty_staging_parents(self, src: str) -> None:
+        """Remove the staging dirs a nested name's move emptied, up to (not
+        including) source_path. Stops at the first one still holding something,
+        such as another nested job's download."""
+        parent = os.path.dirname(src)
+        while os.path.normpath(parent) != os.path.normpath(self.__source_path):
+            try:
+                os.rmdir(parent)
+            except OSError:
+                return
+            parent = os.path.dirname(parent)
 
     def pop_failed(self) -> list[MoveFailedResult]:
         """Process-safe method to retrieve any move failures."""

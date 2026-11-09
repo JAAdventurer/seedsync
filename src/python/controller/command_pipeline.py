@@ -209,10 +209,9 @@ class CommandPipeline:
         if file.remote_size is None:
             _notify_failure(command, f"File '{command.filename}' does not exist remotely")
             return False
-        # A nested job would land under the staging dir, and the staging move
-        # only handles top-level names, so the download would never arrive.
-        if file.parent is not None and pc.effective_local_path != pc.local_path:
-            _notify_failure(command, "Queuing a nested file is not supported while staging is enabled")
+        moving = self._find_overlapping_move(command.filename, pc)
+        if moving is not None:
+            _notify_failure(command, f"A staging move is in progress for '{moving}'")
             return False
         try:
             exclude = parse_exclude_patterns(self._context.config.general.exclude_patterns)
@@ -220,7 +219,28 @@ class CommandPipeline:
         except LftpError as e:
             _notify_failure(command, f"Lftp error: {e!s}")
             return False
+        if is_nested_name(command.filename):
+            if pc.effective_local_path != pc.local_path:
+                pc.pending_nested_moves.add(command.filename)
+            # A nested job's move has no requeue diff to reset it
+            # (ModelUpdater._handle_requeued_file sees top-level files only).
+            move_key = persist_key(pc.pair_id, command.filename)
+            self.moved_file_keys.discard(move_key)
+            if move_key in self._persist.move_failed_file_names:
+                self._persist.move_failed_file_names.discard(move_key)
+                self.sync_persist_callback()
         return True
+
+    def _find_overlapping_move(self, name: str, pc: PairContext) -> str | None:
+        """Name of an in-flight staging move for this pair that `name` lies inside
+        or contains, or None. lftp writing into a tree mid-move would race it."""
+        for move_process in self.active_move_processes:
+            if move_process.pair_id != pc.pair_id:
+                continue
+            moving = move_process.file_name
+            if name == moving or name.startswith(moving + "/") or moving.startswith(name + "/"):
+                return moving
+        return None
 
     @staticmethod
     def _iter_active_descendants(file: ModelFile) -> Iterator[ModelFile]:
@@ -782,13 +802,15 @@ class CommandPipeline:
             return
         self.spawn_move_process(file_name, pc)
 
-    def spawn_move_process(self, file_name: str, pc: PairContext) -> bool:
+    def spawn_move_process(self, file_name: str, pc: PairContext, expected_size: int | None = None) -> bool:
         """Spawn a MoveProcess to move a file from staging to the final local_path.
 
         Returns True if a move process was actually spawned, False if the call was
         a no-op (already moved / in flight, staging disabled, or nothing left in
         staging). A retry of a failed move uses this to tell a real retry from a
         resolved no-op so it can clear a stale MOVE_FAILED state (#536 follow-up).
+
+        expected_size (see MoveProcess) is set for a nested job that just ended.
         """
         pair_id = pc.pair_id
         move_key = persist_key(pair_id, file_name)
@@ -815,6 +837,7 @@ class CommandPipeline:
             file_name=file_name,
             pair_id=pair_id,
             umask=self._context.args.umask,
+            expected_size=expected_size,
         )
         process.set_mp_log_queue(self._mp_logger.queue, self._mp_logger.log_level)
         # Start before publishing bookkeeping: if start() raises we must not leave
