@@ -8,7 +8,7 @@ from controller.model_updater import ModelUpdater
 from controller.persist_keys import KEY_SEP, persist_key
 from controller.scan.scanner_process import ScannerResult
 from lftp import LftpJobStatus
-from model import ModelDiff, ModelFile
+from model import ModelDiff, ModelError, ModelFile
 
 
 class TestSyncPersistToAllBuilders(unittest.TestCase):
@@ -262,6 +262,195 @@ class TestDetectLftpCompletionsNestedFiltering(unittest.TestCase):
         self.assertEqual({"TopLevel"}, pc.pending_completion)
 
 
+class TestSpawnNestedMoves(unittest.TestCase):
+    """A nested job's lftp job ending (completion or Stop) triggers its
+    staging->final move directly, since it has no DOWNLOADED diff to drive it."""
+
+    def _make_pair_context(self, pair_id=None):
+        pc = MagicMock()
+        pc.pair_id = pair_id
+        pc.prev_downloading_file_names = set()
+        pc.pending_completion = set()
+        pc.pending_nested_moves = set()
+        return pc
+
+    def _make_updater(self, pair_contexts, persist=None, *, use_staging=True, staging_path="/tmp/staging"):
+        pipeline = MagicMock()
+        registry = MagicMock()
+        extract_process = MagicMock()
+        validate_process = MagicMock()
+        context = MagicMock()
+        context.config.controller.use_staging = use_staging
+        context.config.controller.staging_path = staging_path
+        logger = MagicMock()
+
+        updater = ModelUpdater(
+            pair_contexts=pair_contexts,
+            persist=persist or MagicMock(),
+            pipeline=pipeline,
+            registry=registry,
+            extract_process=extract_process,
+            validate_process=validate_process,
+            context=context,
+            password=None,
+            logger=logger,
+        )
+        return updater, pipeline, registry
+
+    def _make_persist(self):
+        persist = MagicMock()
+        persist.downloaded_file_names = set()
+        return persist
+
+    def _running(self, name):
+        return LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, name, "")
+
+    def test_pending_nested_move_spawned_once_lftp_no_longer_lists_it(self):
+        pc = self._make_pair_context("pair-1")
+        pc.pending_nested_moves = {"Top/leaf.rar"}
+        updater, pipeline, registry = self._make_updater([pc], self._make_persist())
+        resolved = MagicMock()
+        resolved.remote_size = 12345
+        registry.resolve_full_path.return_value = resolved
+
+        updater._detect_lftp_completions(pc, [])
+
+        registry.resolve_full_path.assert_called_once_with("Top/leaf.rar", pair_id="pair-1")
+        pipeline.spawn_move_process.assert_called_once_with("Top/leaf.rar", pc, expected_size=12345)
+        self.assertEqual(set(), pc.pending_nested_moves)
+
+    def test_job_never_seen_running_still_spawns_move(self):
+        """A job that finishes between two status polls (a small file, or one
+        already complete in staging) never shows as running; the queue-driven
+        pending set still moves it."""
+        pc = self._make_pair_context("pair-1")
+        pc.pending_nested_moves = {"Top/leaf.rar"}
+        pc.prev_downloading_file_names = set()
+        updater, pipeline, registry = self._make_updater([pc], self._make_persist())
+        registry.resolve_full_path.return_value.remote_size = 10
+
+        updater._detect_lftp_completions(pc, [])
+
+        pipeline.spawn_move_process.assert_called_once_with("Top/leaf.rar", pc, expected_size=10)
+
+    def test_pending_nested_move_waits_while_lftp_lists_it(self):
+        pc = self._make_pair_context("pair-1")
+        pc.pending_nested_moves = {"Top/leaf.rar"}
+        updater, pipeline, registry = self._make_updater([pc], self._make_persist())
+
+        updater._detect_lftp_completions(pc, [self._running("Top/leaf.rar")])
+
+        pipeline.spawn_move_process.assert_not_called()
+        self.assertEqual({"Top/leaf.rar"}, pc.pending_nested_moves)
+
+    def test_pending_nested_move_with_unresolvable_row_stays_in_staging(self):
+        """The row can be gone by the time this runs (e.g. a remote delete
+        raced the completion). Without a remote size a stopped partial can't be
+        told from a finished download, so nothing is moved."""
+        pc = self._make_pair_context("pair-1")
+        pc.pending_nested_moves = {"Top/leaf.rar"}
+        updater, pipeline, registry = self._make_updater([pc], self._make_persist())
+        registry.resolve_full_path.side_effect = ModelError("not found")
+
+        updater._detect_lftp_completions(pc, [])
+
+        pipeline.spawn_move_process.assert_not_called()
+        self.assertEqual(set(), pc.pending_nested_moves)
+
+    def test_pending_nested_move_with_no_remote_size_stays_in_staging(self):
+        pc = self._make_pair_context("pair-1")
+        pc.pending_nested_moves = {"Top/leaf.rar"}
+        updater, pipeline, registry = self._make_updater([pc], self._make_persist())
+        registry.resolve_full_path.return_value.remote_size = None
+
+        updater._detect_lftp_completions(pc, [])
+
+        pipeline.spawn_move_process.assert_not_called()
+
+    def test_completion_without_pending_entry_spawns_nothing(self):
+        """Only names queued under staging are moved: a nested job ending with
+        staging off, or any top-level job, never enters the pending set."""
+        pc = self._make_pair_context("pair-1")
+        pc.prev_downloading_file_names = {"Top/leaf.rar", "TopLevel"}
+        updater, pipeline, registry = self._make_updater([pc], self._make_persist())
+
+        updater._detect_lftp_completions(pc, [])
+
+        pipeline.spawn_move_process.assert_not_called()
+        registry.resolve_full_path.assert_not_called()
+
+
+class TestPruneAbsentNestedMoveFailures(unittest.TestCase):
+    """Nested move_failed keys never reach downloaded_file_names (the prune
+    that drives _prune_absent_persist_entries), so they get their own pass."""
+
+    def _make_pair_context(self, pair_id=None):
+        pc = MagicMock()
+        pc.pair_id = pair_id
+        return pc
+
+    def _make_updater(self, pair_contexts, persist):
+        pipeline = MagicMock()
+        registry = MagicMock()
+        extract_process = MagicMock()
+        validate_process = MagicMock()
+        context = MagicMock()
+        logger = MagicMock()
+
+        updater = ModelUpdater(
+            pair_contexts=pair_contexts,
+            persist=persist,
+            pipeline=pipeline,
+            registry=registry,
+            extract_process=extract_process,
+            validate_process=validate_process,
+            context=context,
+            password=None,
+            logger=logger,
+        )
+        updater._persist_sync = MagicMock()
+        return updater, registry
+
+    def _make_persist(self, move_failed):
+        persist = MagicMock()
+        persist.move_failed_file_names = move_failed
+        return persist
+
+    def test_unresolvable_nested_key_removed(self):
+        pc = self._make_pair_context("pair-1")
+        fail_key = persist_key("pair-1", "Top/leaf.rar")
+        persist = self._make_persist({fail_key})
+        updater, registry = self._make_updater([pc], persist)
+        registry.resolve_full_path.side_effect = ModelError("gone")
+
+        updater._prune_absent_nested_move_failures()
+
+        registry.resolve_full_path.assert_called_once_with("Top/leaf.rar", pair_id="pair-1")
+        self.assertNotIn(fail_key, persist.move_failed_file_names)
+
+    def test_resolvable_nested_key_kept(self):
+        pc = self._make_pair_context("pair-1")
+        fail_key = persist_key("pair-1", "Top/leaf.rar")
+        persist = self._make_persist({fail_key})
+        updater, registry = self._make_updater([pc], persist)
+        registry.resolve_full_path.return_value = MagicMock()
+
+        updater._prune_absent_nested_move_failures()
+
+        self.assertIn(fail_key, persist.move_failed_file_names)
+
+    def test_top_level_key_untouched(self):
+        pc = self._make_pair_context("pair-1")
+        fail_key = persist_key("pair-1", "TopLevel")
+        persist = self._make_persist({fail_key})
+        updater, registry = self._make_updater([pc], persist)
+
+        updater._prune_absent_nested_move_failures()
+
+        registry.resolve_full_path.assert_not_called()
+        self.assertIn(fail_key, persist.move_failed_file_names)
+
+
 class TestRetryFailedMoves(unittest.TestCase):
     """In-session retry of failed staging->final moves (#536)."""
 
@@ -341,6 +530,32 @@ class TestRetryFailedMoves(unittest.TestCase):
         updater._retry_failed_moves()
 
         pipeline.spawn_move_process.assert_not_called()
+
+    def test_retry_count_dropped_when_key_cleared_without_requeue_diff(self):
+        """A nested re-queue clears move_failed_file_names directly
+        (CommandPipeline._handle_queue), with no requeue diff to reset the
+        retry count, so the count must be dropped here instead - otherwise a
+        later failure on the same name would start part-way through the budget."""
+        pc = self._make_pair_context("pair-1")
+        fail_key = persist_key("pair-1", "Top/leaf.rar")
+        persist = self._make_persist(move_failed=set())  # cleared by the re-queue
+        updater, pipeline = self._make_updater([pc], persist)
+        updater._move_retry_counts[fail_key] = ModelUpdater.MAX_MOVE_RETRIES
+
+        updater._retry_failed_moves()
+
+        self.assertNotIn(fail_key, updater._move_retry_counts)
+
+    def test_retry_count_kept_while_key_still_failed(self):
+        pc = self._make_pair_context("pair-1")
+        fail_key = persist_key("pair-1", "file.txt")
+        persist = self._make_persist(move_failed={fail_key})
+        updater, pipeline = self._make_updater([pc], persist)
+        updater._move_retry_counts[fail_key] = 1
+
+        updater._retry_failed_moves()
+
+        self.assertIn(fail_key, updater._move_retry_counts)
 
     def test_retry_budget_caps_respawns(self):
         """A permanently-failing move must stop re-spawning after MAX_MOVE_RETRIES

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import errno
 import os
@@ -38,6 +39,8 @@ class MoveProcess(AppOneShotProcess):
         file_name: str,
         pair_id: str | None = None,
         umask: int | None = None,
+        expected_size: int | None = None,
+        nested_expected_sizes: dict[str, int | None] | None = None,
     ):
         super().__init__(name=self.__class__.__name__)
         self.__source_path = source_path
@@ -47,6 +50,13 @@ class MoveProcess(AppOneShotProcess):
         # When set, the moved tree is chmod'ed to 0666/0777 & ~umask here, in
         # this process, rather than on the controller thread (#811).
         self.__umask = umask
+        # When set, a source smaller than this or still holding lftp temp files
+        # is left in place, with no failure reported.
+        self.__expected_size = expected_size
+        # {path relative to file_name: expected size} of descendants to check
+        # the same way; an incomplete one (or one of unknown size) is left in
+        # place while the rest of the tree moves.
+        self.__nested_expected_sizes = nested_expected_sizes or {}
         self.__failed_result_stream = PipeStream()
 
     @property
@@ -90,8 +100,9 @@ class MoveProcess(AppOneShotProcess):
         return total
 
     @staticmethod
-    def _has_lftp_temp_files(src: str) -> bool:
-        """True if the source tree still contains lftp temp files (``*.lftp``).
+    def _has_lftp_temp_files(src: str, skip: frozenset[str] = frozenset()) -> bool:
+        """True if the source tree still contains lftp temp files (``*.lftp``),
+        not counting anything under the paths in ``skip``.
 
         lftp writes each download to ``<name>.lftp`` and renames it to the final
         name on completion. A staging tree that still holds temp files has not
@@ -99,8 +110,12 @@ class MoveProcess(AppOneShotProcess):
         """
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
         if os.path.isfile(src):
-            return src.endswith(suffix)
-        return any(any(f.endswith(suffix) for f in filenames) for _root, _dirs, filenames in os.walk(src))
+            return src.endswith(suffix) and src not in skip
+        for root, dirs, filenames in os.walk(src):
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in skip]
+            if any(f.endswith(suffix) and os.path.join(root, f) not in skip for f in filenames):
+                return True
+        return False
 
     def _report_failure(self, message: str) -> None:
         """Log and publish a move failure so the controller can surface it."""
@@ -122,13 +137,21 @@ class MoveProcess(AppOneShotProcess):
             self._report_failure(f"Move failed: source does not exist: {src}")
             return
 
+        if self.__expected_size is not None and (
+            self._has_lftp_temp_files(src) or self._get_total_size(src) < self.__expected_size
+        ):
+            self.logger.info(f"Move skipped for {self.__file_name}: download incomplete, left in staging")
+            return
+
+        incomplete = self._incomplete_nested(src)
+
         # Defer while lftp is still finalizing the staging tree. lftp renames
         # "<name>.lftp" -> "<name>" on completion; copying (or renaming the
         # whole tree) while a rename is in flight races — copytree lists the
         # ".lftp" entry, lftp renames it, and the copy then fails with ENOENT
         # (which used to crash this process). A tree that still has temp files is
         # not ready, so report a recoverable failure and retry once lftp finishes.
-        if self._has_lftp_temp_files(src):
+        if self._has_lftp_temp_files(src, incomplete):
             self._report_failure(
                 f"Move deferred for {self.__file_name}: download not finalized "
                 "(lftp temp files still present in staging). Will retry."
@@ -137,15 +160,59 @@ class MoveProcess(AppOneShotProcess):
 
         self.logger.info(f"Moving {src} -> {dst}")
 
-        # Ensure destination parent directory exists
-        os.makedirs(self.__dest_path, exist_ok=True)
+        # Ensure the destination's parent exists (several levels for a nested name)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+        if not incomplete:
+            if not self._move_item(src, dst):
+                return
+        else:
+            if not self._move_tree(src, dst, incomplete):
+                return
+            left = ", ".join(sorted(os.path.relpath(p, self.__source_path) for p in incomplete))
+            self.logger.info(f"Left incomplete nested downloads in staging: {left}")
+        self.__apply_modes(dst)
+        self.__prune_empty_staging_parents(src)
+
+    def _incomplete_nested(self, src: str) -> frozenset[str]:
+        """Absolute staging paths of the listed nested downloads under src that
+        aren't complete yet (temp files, short, or of unknown size)."""
+        incomplete: set[str] = set()
+        for rel, size in self.__nested_expected_sizes.items():
+            path = os.path.join(src, rel)
+            if os.path.exists(path) and (
+                size is None or self._has_lftp_temp_files(path) or self._get_total_size(path) < size
+            ):
+                incomplete.add(path)
+        return frozenset(incomplete)
+
+    def _move_tree(self, src: str, dst: str, incomplete: frozenset[str]) -> bool:
+        """Move src to dst, leaving the paths in ``incomplete`` (and the dirs
+        holding them) in staging. Subtrees without one move whole."""
+        if src in incomplete:
+            return True
+        if not any(p.startswith(src + os.sep) for p in incomplete):
+            # Parents are made only once something lands in them, so a dir
+            # holding nothing but incomplete downloads isn't created at dst.
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            return self._move_item(src, dst)
+        for entry in os.listdir(src):
+            if not self._move_tree(os.path.join(src, entry), os.path.join(dst, entry), incomplete):
+                return False
+        with contextlib.suppress(OSError):  # still holds an incomplete download
+            os.rmdir(src)
+        return True
+
+    def _move_item(self, src: str, dst: str) -> bool:
+        """Move one file or tree: rename, or copy + verify + delete across
+        devices or onto a non-empty dir. Reports and returns False on failure."""
+        name = os.path.relpath(src, self.__source_path)
 
         # Try rename first (instant on same filesystem)
         try:
             os.rename(src, dst)
-            self.logger.info(f"Move completed via rename: {self.__file_name}")
-            self.__apply_modes(dst)
-            return
+            self.logger.info(f"Move completed via rename: {name}")
+            return True
         except OSError as e:
             if e.errno == errno.EXDEV:
                 self.logger.debug("Cross-device move detected, falling back to copy+delete")
@@ -169,18 +236,18 @@ class MoveProcess(AppOneShotProcess):
             # narrow window the pre-check above doesn't fully close). Report a
             # recoverable failure and keep the source intact so the move is
             # retried — never crash the controller.
-            self._report_failure(f"Move copy failed for {self.__file_name}: {e}. Source NOT deleted.")
-            return
+            self._report_failure(f"Move copy failed for {name}: {e}. Source NOT deleted.")
+            return False
 
         # Verify only the copied subtree (ignore pre-existing files under dst)
         copied_size = self._get_copied_size(src, dst)
 
         if source_size != copied_size:
             self._report_failure(
-                f"Move size verification failed for {self.__file_name}: "
+                f"Move size verification failed for {name}: "
                 f"source={source_size} copied={copied_size}. Source NOT deleted."
             )
-            return
+            return False
 
         # Size verified, remove source
         if os.path.isfile(src):
@@ -188,12 +255,24 @@ class MoveProcess(AppOneShotProcess):
         else:
             shutil.rmtree(src)
 
-        self.logger.info(f"Move completed via copy+delete: {self.__file_name}")
-        self.__apply_modes(dst)
+        self.logger.info(f"Move completed via copy+delete: {name}")
+        return True
 
     def __apply_modes(self, dst: str) -> None:
         if self.__umask is not None:
             apply_umask_modes(dst, self.__umask, self.logger)
+
+    def __prune_empty_staging_parents(self, src: str) -> None:
+        """Remove the staging dirs a nested name's move emptied, up to (not
+        including) source_path. Stops at the first one still holding something,
+        such as another nested job's download."""
+        parent = os.path.dirname(src)
+        while os.path.normpath(parent) != os.path.normpath(self.__source_path):
+            try:
+                os.rmdir(parent)
+            except OSError:
+                return
+            parent = os.path.dirname(parent)
 
     def pop_failed(self) -> list[MoveFailedResult]:
         """Process-safe method to retrieve any move failures."""

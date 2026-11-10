@@ -304,6 +304,14 @@ class ModelBuilder:
                 _child_model_file.state, _effective_transfer_state = ModelBuilder._determine_child_state(
                     _is_dir, _child_transfer_state, _nested_status, _remote_child, _local_child, root_model_file
                 )
+                # A nested job whose staging->final move failed. Unlike a root
+                # (_determine_state) there's no post-download state to require:
+                # the file sits in staging, which the local scan doesn't cover.
+                if _child_model_file.full_path in self.__move_failed_files and _child_model_file.state not in (
+                    ModelFile.State.QUEUED,
+                    ModelFile.State.DOWNLOADING,
+                ):
+                    _child_model_file.state = ModelFile.State.MOVE_FAILED
 
                 # fill the rest
                 ModelBuilder._fill_model_file(_child_model_file, _remote_child, _local_child, _effective_transfer_state)
