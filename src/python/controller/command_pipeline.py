@@ -25,6 +25,7 @@ from .exclude_patterns import parse_exclude_patterns
 from .extract import ExtractProcess, ExtractRequest
 from .model_registry import ModelRegistry
 from .move import MoveProcess
+from .nested_persist import all_remote_descendants_done
 from .pair_context import PairContext
 from .persist_keys import persist_key
 from .validate import ValidateProcess, ValidateRequest
@@ -223,12 +224,11 @@ class CommandPipeline:
             if pc.effective_local_path != pc.local_path:
                 pc.pending_nested_moves.add(command.filename)
                 pc.staged_nested.add(command.filename)
-            # A nested job's move has no requeue diff to reset it
+            # A nested job has no requeue diff to reset its keys
             # (ModelUpdater._handle_requeued_file sees top-level files only).
             move_key = persist_key(pc.pair_id, command.filename)
             self.moved_file_keys.discard(move_key)
-            if move_key in self._persist.move_failed_file_names:
-                self._persist.move_failed_file_names.discard(move_key)
+            if self._persist.discard_subtree(move_key):
                 self.sync_persist_callback()
         return True
 
@@ -430,6 +430,15 @@ class CommandPipeline:
         if file.local_size is None:
             _notify_failure(command, f"File '{command.filename}' does not exist locally")
             return False
+        if (
+            file.parent is not None
+            and file.remote_size is not None
+            and (file.state == ModelFile.State.DOWNLOADED or (file.is_dir and all_remote_descendants_done(file)))
+        ):
+            # Nested rows only get a persist key from their own job; record this
+            # one so it reads DELETED, not DEFAULT, once it's gone locally.
+            self._persist.downloaded_file_names.add(persist_key(pc.pair_id, command.filename))
+            self.sync_persist_callback()
         delete_path = pc.local_path
         pair_staging = self._pair_staging_dir(pc)
         if pair_staging:

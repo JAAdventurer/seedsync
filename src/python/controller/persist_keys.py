@@ -17,6 +17,12 @@ def persist_key(pair_id: str | None, name: str) -> str:
     return f"{pair_id}{KEY_SEP}{name}" if pair_id else name
 
 
+def bare_name(key: str) -> str:
+    """The file name part of a persist key, whichever pair it belongs to."""
+    _pair_id, sep, name = key.partition(KEY_SEP)
+    return name if sep else key
+
+
 def strip_persist_key(key: str, pair_id: str | None) -> str:
     """Strip pair_id prefix from a persist key to get the bare file name.
 

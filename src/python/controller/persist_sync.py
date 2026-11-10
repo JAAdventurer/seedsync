@@ -26,9 +26,7 @@ class PersistSync:
 
     def sync(self):
         """Push current persist state to all pair model builders, filtered by pair_id."""
-        namespaced_prefixes = tuple(
-            f"{other_pc.pair_id}{sep}" for other_pc in self._pair_contexts if other_pc.pair_id for sep in (KEY_SEP, ":")
-        )
+        namespaced_prefixes = self._namespaced_prefixes()
         for pc in self._pair_contexts:
             pc.model_builder.set_downloaded_files(
                 self._filter_keys_for_pair(self._persist.downloaded_file_names, pc.pair_id, namespaced_prefixes)
@@ -48,6 +46,15 @@ class PersistSync:
             pc.model_builder.set_move_failed_files(
                 self._filter_keys_for_pair(self._persist.move_failed_file_names, pc.pair_id, namespaced_prefixes)
             )
+
+    def names_for_pair(self, keys: set[str], pair_id: str | None) -> set[str]:
+        """The bare names of the keys that belong to pair_id."""
+        return self._filter_keys_for_pair(keys, pair_id, self._namespaced_prefixes())
+
+    def _namespaced_prefixes(self) -> tuple[str, ...]:
+        return tuple(
+            f"{other_pc.pair_id}{sep}" for other_pc in self._pair_contexts if other_pc.pair_id for sep in (KEY_SEP, ":")
+        )
 
     @staticmethod
     def _filter_keys_for_pair(keys: set[str], pair_id: str | None, namespaced_prefixes: tuple[str, ...]) -> set[str]:

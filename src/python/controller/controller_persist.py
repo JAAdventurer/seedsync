@@ -43,6 +43,20 @@ class ControllerPersist(Persist):
         """The six persisted key sets, keyed by json key."""
         return {key: getattr(self, f"{key}_file_names") for key, _ in self._KEYS}
 
+    def discard_subtree(self, pkey: str) -> bool:
+        """Drop pkey and every nested key under it ('pkey/...') from all sets.
+
+        Returns True if anything was removed.
+        """
+        prefix = pkey + "/"
+        removed = False
+        for names in self.all_sets().values():
+            stale = {k for k in names if k == pkey or k.startswith(prefix)}
+            if stale:
+                names.difference_update(stale)
+                removed = True
+        return removed
+
     @staticmethod
     def _migrate_legacy_keys(keys: set[str]) -> set[str]:
         """Replace legacy 'pair_id:name' keys with 'pair_id\\x1fname' keys."""

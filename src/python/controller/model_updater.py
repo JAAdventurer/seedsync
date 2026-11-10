@@ -24,7 +24,7 @@ from .exclude_patterns import filter_excluded_files
 from .extract import ExtractCompletedResult, ExtractFailedResult, ExtractProcess, ExtractStatus, ExtractStatusResult
 from .model_registry import ModelRegistry
 from .pair_context import PairContext
-from .persist_keys import persist_key, strip_persist_key
+from .persist_keys import bare_name, persist_key, strip_persist_key
 from .persist_sync import PersistSync
 from .scan.scanner_process import ScannerResult
 from .validate import (
@@ -79,6 +79,15 @@ class ModelUpdater:
         # permanently-failing move (e.g. a full disk) does not re-spawn forever.
         # Held in memory only, so a restart grants a fresh budget.
         self._move_retry_counts: dict[str, int] = {}
+        # Nested downloads a restart left in staging: listed in staged_nested
+        # on the first cycle, then moved once every scan is in
+        # (see _remember_staged_nested / _recover_staged_nested).
+        self._staged_nested_remembered = False
+        self._staged_nested_recovered = False
+        # Per pair: its nested persist names that are staged, and the names
+        # that set was computed from (see _refresh_staged).
+        self._staged: dict[str | None, set[str]] = {}
+        self._staged_from: dict[str | None, frozenset[str]] = {}
 
     def update(self) -> None:
         # Grab the latest extract results. Completed/failed go through the
@@ -97,6 +106,7 @@ class ModelUpdater:
         # Process each pair context's scan results and LFTP status
         for pc in self._pair_contexts:
             self._update_pair_model_state(pc, latest_extract_statuses, latest_validate_statuses)
+        self._remember_staged_nested()
 
         self._process_extraction_completions(latest_extracted_results)
 
@@ -108,6 +118,7 @@ class ModelUpdater:
         self._prune_stale_persist()
         self._process_extraction_failures(latest_failed_extractions)
         self._process_validation_results(latest_validated_results, latest_failed_validations)
+        self._recover_staged_nested()
         self._retry_failed_moves()
         self._update_controller_status()
 
@@ -187,8 +198,8 @@ class ModelUpdater:
         ):
             pkey = persist_key(diff.new_file.pair_id, diff.new_file.name)
             self._pipeline.moved_file_keys.discard(pkey)
-            for names in self._persist.all_sets().values():
-                names.discard(pkey)
+            # The whole tree downloads again, so nested keys under it go too.
+            self._persist.discard_subtree(pkey)
             self._move_retry_counts.pop(pkey, None)
             self.sync_persist_to_all_builders()
 
@@ -318,6 +329,9 @@ class ModelUpdater:
             model_keys.add(persist_key(f.pair_id, f.name))
         absent_keys: set[str] = set()
         for pkey in self._persist.downloaded_file_names:
+            # model_keys are top-level; nested keys are pruned below
+            if is_nested_name(bare_name(pkey)):
+                continue
             if pkey not in model_keys and pkey not in self._pipeline.moved_file_keys:
                 absent_keys.add(pkey)
         if absent_keys:
@@ -327,30 +341,104 @@ class ModelUpdater:
             for key in absent_keys:
                 self._move_retry_counts.pop(key, None)
             self.sync_persist_to_all_builders()
-        self._prune_absent_nested_move_failures()
+        self._prune_absent_nested_entries()
 
-    def _prune_absent_nested_move_failures(self) -> None:
-        """Drop nested move_failed keys whose row is gone (remote and local).
+    def _prune_absent_nested_entries(self) -> None:
+        """Drop nested keys whose row is gone (remote and local).
 
-        Nested keys never reach downloaded_file_names, which drives the prune
-        above, so they need their own pass. Called once all scans are in.
+        The prune above matches top-level model keys only. A nested download
+        still in staging has no local presence, so its key stays. Called once
+        all scans are in.
         """
         absent_keys: set[str] = set()
-        for key in self._persist.move_failed_file_names:
-            for pc in self._pair_contexts:
-                bare_name = strip_persist_key(key, pc.pair_id)
-                if bare_name == key and pc.pair_id is not None:
-                    continue
-                if is_nested_name(bare_name):
+        for pc in self._pair_contexts:
+            for names in self._persist.all_sets().values():
+                for name in self._persist_sync.names_for_pair(names, pc.pair_id):
+                    if not is_nested_name(name) or name in self._staged_for(pc):
+                        continue
                     try:
-                        self._registry.resolve_full_path(bare_name, pair_id=pc.pair_id)
+                        self._registry.resolve_full_path(name, pair_id=pc.pair_id)
                     except ModelError:
-                        absent_keys.add(key)
-                break
+                        absent_keys.add(persist_key(pc.pair_id, name))
         if absent_keys:
-            self._logger.info(f"Persist cleanup (nested move failures gone): {absent_keys}")
-            self._persist.move_failed_file_names.difference_update(absent_keys)
+            self._logger.info(f"Persist cleanup (nested rows gone): {absent_keys}")
+            for names in self._persist.all_sets().values():
+                names.difference_update(absent_keys)
             self.sync_persist_to_all_builders()
+
+    def _refresh_staged(self, pc: PairContext, local_scan_arrived: bool) -> None:
+        """Recompute which of this pair's nested persist names are staged: still
+        in its staging dir, or out of it (moved, or carried along by an
+        ancestor's move) since the last local scan. Those rows have no local
+        presence but aren't deleted.
+
+        Stats only when the pair's nested names change or a local scan arrives
+        (a finished move or delete forces one), not every cycle, so a slow
+        mount can't stall the controller loop (#811).
+        """
+        if pc.effective_local_path == pc.local_path:
+            return
+        names = frozenset(
+            name
+            for keys in self._persist.all_sets().values()
+            for name in self._persist_sync.names_for_pair(keys, pc.pair_id)
+            if is_nested_name(name)
+        )
+        prev = self._staged.get(pc.pair_id)
+        if prev is not None and not local_scan_arrived and names == self._staged_from[pc.pair_id]:
+            return
+        staged = {name for name in names if os.path.exists(os.path.join(pc.effective_local_path, name))}
+        if prev is not None and not local_scan_arrived:
+            staged |= prev & names
+        self._staged[pc.pair_id] = staged
+        self._staged_from[pc.pair_id] = names
+
+    def _staged_for(self, pc: PairContext) -> set[str]:
+        return self._staged.get(pc.pair_id, set())
+
+    def _remember_staged_nested(self) -> None:
+        """On the first cycle, list the nested downloads a restart left in
+        staging in pc.staged_nested.
+
+        Startup brings their top-level ancestor in as an ADDED DOWNLOADED diff
+        on that same cycle, and its move reads staged_nested to leave the
+        incomplete ones behind (CommandPipeline.spawn_move_process). That only
+        needs persist and the filesystem, so it doesn't wait for the scans.
+        """
+        if self._staged_nested_remembered:
+            return
+        self._staged_nested_remembered = True
+        for pc in self._pair_contexts:
+            pc.staged_nested.update(self._staged_for(pc))
+
+    def _recover_staged_nested(self) -> None:
+        """Move nested downloads a restart left in staging.
+
+        Their move starts when the job ends (_spawn_nested_moves), which is
+        in-memory, so a restart between the two strands them. The key may come
+        from a Stop, so the move gets the row's remote size to check, and a row
+        that's gone remotely is left alone.
+        """
+        if self._staged_nested_recovered:
+            return
+        if not all(_pc.remote_scan_received and _pc.local_scan_received for _pc in self._pair_contexts):
+            return
+        self._staged_nested_recovered = True
+        for pc in self._pair_contexts:
+            downloaded = self._persist_sync.names_for_pair(self._persist.downloaded_file_names, pc.pair_id)
+            for name in self._staged_for(pc) & downloaded:
+                # Skip one already moving, e.g. inside an ancestor's top-level move.
+                if self._pipeline.find_overlapping_move(name, pc):
+                    continue
+                try:
+                    remote_size = self._registry.resolve_full_path(name, pair_id=pc.pair_id).remote_size
+                except ModelError:
+                    remote_size = None
+                if remote_size is None:
+                    self._logger.warning(f"Not moving '{name}' out of staging: its remote size is unknown")
+                    continue
+                self._logger.info(f"Moving '{name}' left in staging by a restart")
+                self._pipeline.spawn_move_process(name, pc, expected_size=remote_size)
 
     def _process_extraction_failures(self, latest_failed_extractions: list[ExtractFailedResult]) -> None:
         """Process extraction failures -- mark as failed immediately."""
@@ -527,6 +615,8 @@ class ModelUpdater:
         pc.active_scanner.set_active_files(active_files)
 
         pc.model_builder.set_auto_delete_remote(bool(self._context.config.autoqueue.auto_delete_remote))
+        self._refresh_staged(pc, latest_local_scan is not None and not latest_local_scan.failed)
+        pc.model_builder.set_staged_files(self._staged_for(pc))
 
         # Likewise keep the last good listing on a failed scan: an empty remote
         # list would prune persist records and later re-queue every download;
@@ -557,9 +647,7 @@ class ModelUpdater:
             if just_completed:
                 for name in just_completed:
                     self._logger.info(f"Download completed (LFTP job finished): {name}")
-                self._persist.downloaded_file_names.update(
-                    persist_key(pc.pair_id, n) for n in just_completed if not is_nested_name(n)
-                )
+                self._persist.downloaded_file_names.update(persist_key(pc.pair_id, n) for n in just_completed)
                 self.sync_persist_to_all_builders()
                 # Same "/" filter as active_downloading_file_names below, same
                 # reason: pending_completion feeds active_scanner too (see the

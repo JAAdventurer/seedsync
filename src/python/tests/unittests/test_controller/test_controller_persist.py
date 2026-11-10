@@ -241,6 +241,39 @@ class TestControllerPersist(unittest.TestCase):
             persist.corrupt_file_names,
         )
 
+    def test_discard_subtree_removes_exact_and_nested_keys_from_every_set(self):
+        persist = ControllerPersist()
+        for names in persist.all_sets().values():
+            names.add("Top")
+            names.add("Top/a")
+            names.add("Top/b/c")
+
+        removed = persist.discard_subtree("Top")
+
+        self.assertTrue(removed)
+        for names in persist.all_sets().values():
+            self.assertEqual(set(), names)
+
+    def test_discard_subtree_keeps_keys_with_a_shared_prefix(self):
+        persist = ControllerPersist()
+        persist.downloaded_file_names.add("Top")
+        persist.downloaded_file_names.add("TopX")
+        persist.downloaded_file_names.add("TopX/a")
+
+        removed = persist.discard_subtree("Top")
+
+        self.assertTrue(removed)
+        self.assertEqual({"TopX", "TopX/a"}, persist.downloaded_file_names)
+
+    def test_discard_subtree_returns_false_when_nothing_matches(self):
+        persist = ControllerPersist()
+        persist.downloaded_file_names.add("Other")
+
+        removed = persist.discard_subtree("Top")
+
+        self.assertFalse(removed)
+        self.assertEqual({"Other"}, persist.downloaded_file_names)
+
     @timeout_decorator.timeout(30)
     def test_to_str_safe_during_concurrent_mutation(self):
         """to_str() must not raise while another thread mutates the file-name
