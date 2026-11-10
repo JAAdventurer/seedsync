@@ -484,6 +484,7 @@ class TestPruneAbsentNestedEntries(unittest.TestCase):
         registry.resolve_full_path.side_effect = ModelError("gone")
 
         with patch("controller.model_updater.os.path.exists", return_value=True) as exists_mock:
+            updater._refresh_staged(pc, local_scan_arrived=True)
             updater._prune_absent_nested_entries()
 
         exists_mock.assert_called_once_with("/staging/Top/leaf.rar")
@@ -756,10 +757,11 @@ class TestUpdatePairContextScanResults(unittest.TestCase):
         pc = self._make_pc(remote_scan=scan)
         updater = self._make_updater(pc)
         updater._context.config.general.exclude_patterns = []
-        with patch.object(updater, "_staged_nested_names", return_value={"Top/leaf"}) as staged_mock:
+        updater._staged[pc.pair_id] = {"Top/leaf"}
+        with patch.object(updater, "_refresh_staged") as refresh_mock:
             updater._update_pair_model_state(pc, None, None)
 
-        staged_mock.assert_called_once_with(pc)
+        refresh_mock.assert_called_once_with(pc, False)
         pc.model_builder.set_staged_files.assert_called_once_with({"Top/leaf"})
 
 
@@ -915,88 +917,197 @@ class TestRecoverStagedNested(unittest.TestCase):
         persist.downloaded_file_names = downloaded
         return persist
 
+    def _stage(self, updater, pc, exists=True):
+        """Compute the pair's staged set, as a cycle's _update_pair_model_state does."""
+        with patch("controller.model_updater.os.path.exists", return_value=exists):
+            updater._refresh_staged(pc, local_scan_arrived=True)
+
     def test_spawns_once_with_expected_size_and_not_again(self):
         pc = self._make_pair_context()
-        key = persist_key("pair-1", "Top/leaf.rar")
-        persist = self._make_persist({key})
+        persist = self._make_persist({persist_key("pair-1", "Top/leaf.rar")})
         updater, pipeline, registry = self._make_updater([pc], persist)
         registry.resolve_full_path.return_value.remote_size = 500
+        self._stage(updater, pc)
 
-        with patch("controller.model_updater.os.path.exists", return_value=True):
-            updater._recover_staged_nested()
-            updater._recover_staged_nested()
+        updater._recover_staged_nested()
+        updater._recover_staged_nested()
 
         pipeline.spawn_move_process.assert_called_once_with("Top/leaf.rar", pc, expected_size=500)
 
     def test_does_not_spawn_while_an_overlapping_move_runs(self):
         pc = self._make_pair_context()
-        key = persist_key("pair-1", "Top/leaf.rar")
-        persist = self._make_persist({key})
+        persist = self._make_persist({persist_key("pair-1", "Top/leaf.rar")})
         updater, pipeline, registry = self._make_updater([pc], persist)
         registry.resolve_full_path.return_value.remote_size = 500
         pipeline.find_overlapping_move.return_value = "Top"
-
-        with patch("controller.model_updater.os.path.exists", return_value=True):
-            updater._recover_staged_nested()
-
-        pipeline.spawn_move_process.assert_not_called()
-
-    def test_does_not_spawn_for_a_name_only_at_local_path(self):
-        """Already moved out of staging, just not rescanned yet: nothing to move."""
-        pc = self._make_pair_context()
-        key = persist_key("pair-1", "Top/leaf.rar")
-        persist = self._make_persist({key})
-        updater, pipeline, registry = self._make_updater([pc], persist)
-
-        with patch("controller.model_updater.os.path.exists", side_effect=lambda p: p.startswith("/local/")):
-            updater._recover_staged_nested()
-
-        pipeline.spawn_move_process.assert_not_called()
-
-    def test_moved_but_unscanned_name_counts_as_staged(self):
-        """Between a move finishing and the local scan seeing the result, the
-        row has no local presence; it must not read DELETED."""
-        pc = self._make_pair_context()
-        key = persist_key("pair-1", "Top/leaf.rar")
-        persist = self._make_persist({key})
-        updater, _pipeline, _registry = self._make_updater([pc], persist)
-
-        with patch("controller.model_updater.os.path.exists", side_effect=lambda p: p == "/local/Top/leaf.rar"):
-            self.assertEqual({"Top/leaf.rar"}, updater._staged_nested_names(pc))
-
-    def test_does_not_spawn_before_all_scans_received(self):
-        pc = self._make_pair_context()
-        pc.local_scan_received = False
-        key = persist_key("pair-1", "Top/leaf.rar")
-        persist = self._make_persist({key})
-        updater, pipeline, registry = self._make_updater([pc], persist)
-
-        with patch("controller.model_updater.os.path.exists", return_value=True):
-            updater._recover_staged_nested()
-
-        pipeline.spawn_move_process.assert_not_called()
-
-    def test_does_not_spawn_with_staging_off(self):
-        pc = self._make_pair_context(local_path="/local", effective_local_path="/local")
-        key = persist_key("pair-1", "Top/leaf.rar")
-        persist = self._make_persist({key})
-        updater, pipeline, registry = self._make_updater([pc], persist)
+        self._stage(updater, pc)
 
         updater._recover_staged_nested()
 
         pipeline.spawn_move_process.assert_not_called()
 
-    def test_skips_a_row_with_remote_size_none(self):
+    def test_does_not_spawn_for_a_name_not_in_staging(self):
         pc = self._make_pair_context()
-        key = persist_key("pair-1", "Top/leaf.rar")
-        persist = self._make_persist({key})
+        persist = self._make_persist({persist_key("pair-1", "Top/leaf.rar")})
         updater, pipeline, registry = self._make_updater([pc], persist)
-        registry.resolve_full_path.return_value.remote_size = None
+        self._stage(updater, pc, exists=False)
 
-        with patch("controller.model_updater.os.path.exists", return_value=True):
-            updater._recover_staged_nested()
+        updater._recover_staged_nested()
 
         pipeline.spawn_move_process.assert_not_called()
+
+    def test_does_not_spawn_before_all_scans_received(self):
+        pc = self._make_pair_context()
+        pc.local_scan_received = False
+        persist = self._make_persist({persist_key("pair-1", "Top/leaf.rar")})
+        updater, pipeline, registry = self._make_updater([pc], persist)
+        self._stage(updater, pc)
+
+        updater._recover_staged_nested()
+
+        pipeline.spawn_move_process.assert_not_called()
+
+    def test_does_not_spawn_with_staging_off(self):
+        pc = self._make_pair_context(local_path="/local", effective_local_path="/local")
+        persist = self._make_persist({persist_key("pair-1", "Top/leaf.rar")})
+        updater, pipeline, registry = self._make_updater([pc], persist)
+        self._stage(updater, pc)
+
+        updater._recover_staged_nested()
+
+        pipeline.spawn_move_process.assert_not_called()
+
+    def test_warns_and_stays_in_staging_with_no_remote_size(self):
+        pc = self._make_pair_context()
+        persist = self._make_persist({persist_key("pair-1", "Top/leaf.rar")})
+        updater, pipeline, registry = self._make_updater([pc], persist)
+        registry.resolve_full_path.return_value.remote_size = None
+        self._stage(updater, pc)
+
+        updater._recover_staged_nested()
+
+        pipeline.spawn_move_process.assert_not_called()
+        updater._logger.warning.assert_called_once_with(
+            "Not moving 'Top/leaf.rar' out of staging: its remote size is unknown"
+        )
+
+    def test_warns_and_stays_in_staging_with_an_unresolvable_row(self):
+        pc = self._make_pair_context()
+        persist = self._make_persist({persist_key("pair-1", "Top/leaf.rar")})
+        updater, pipeline, registry = self._make_updater([pc], persist)
+        registry.resolve_full_path.side_effect = ModelError("gone")
+        self._stage(updater, pc)
+
+        updater._recover_staged_nested()
+
+        pipeline.spawn_move_process.assert_not_called()
+        updater._logger.warning.assert_called_once_with(
+            "Not moving 'Top/leaf.rar' out of staging: its remote size is unknown"
+        )
+
+
+class TestRefreshStaged(unittest.TestCase):
+    """The staged set is stat'd only when the pair's nested names change or a
+    local scan arrives, never per cycle per key (#811)."""
+
+    def _make_pc(self):
+        pc = MagicMock()
+        pc.pair_id = "pair-1"
+        pc.local_path = "/local"
+        pc.effective_local_path = "/staging"
+        pc.remote_scan_received = True
+        pc.local_scan_received = True
+        pc.staged_nested = set()
+        return pc
+
+    def _make_updater(self, pc, persist):
+        pipeline = MagicMock()
+        pipeline.find_overlapping_move.return_value = None
+        registry = MagicMock()
+        registry.resolve_full_path.return_value.remote_size = 500
+        updater = ModelUpdater(
+            pair_contexts=[pc],
+            persist=persist,
+            pipeline=pipeline,
+            registry=registry,
+            extract_process=MagicMock(),
+            validate_process=MagicMock(),
+            context=MagicMock(),
+            password=None,
+            logger=MagicMock(),
+        )
+        return updater
+
+    def _persist(self, *names):
+        persist = ControllerPersist()
+        persist.downloaded_file_names = {persist_key("pair-1", n) for n in names}
+        return persist
+
+    def test_a_cycle_stats_each_key_at_most_once(self):
+        pc = self._make_pc()
+        persist = self._persist("Top/a", "Top/b", "Other")
+        persist.move_failed_file_names = {persist_key("pair-1", "Top/a")}
+        updater = self._make_updater(pc, persist)
+
+        with patch("controller.model_updater.os.path.exists", return_value=True) as exists_mock:
+            updater._refresh_staged(pc, local_scan_arrived=True)
+            updater._remember_staged_nested()
+            updater._prune_absent_nested_entries()
+            updater._recover_staged_nested()
+
+        paths = [c.args[0] for c in exists_mock.call_args_list]
+        self.assertEqual(sorted(["/staging/Top/a", "/staging/Top/b"]), sorted(paths))
+
+    def test_no_stats_when_nothing_changed(self):
+        pc = self._make_pc()
+        updater = self._make_updater(pc, self._persist("Top/a"))
+        with patch("controller.model_updater.os.path.exists", return_value=True):
+            updater._refresh_staged(pc, local_scan_arrived=True)
+
+        with patch("controller.model_updater.os.path.exists") as exists_mock:
+            updater._refresh_staged(pc, local_scan_arrived=False)
+
+        exists_mock.assert_not_called()
+        self.assertEqual({"Top/a"}, updater._staged_for(pc))
+
+    def test_recomputes_when_a_nested_key_is_added(self):
+        pc = self._make_pc()
+        persist = self._persist("Top/a")
+        updater = self._make_updater(pc, persist)
+        with patch("controller.model_updater.os.path.exists", return_value=True):
+            updater._refresh_staged(pc, local_scan_arrived=True)
+        persist.downloaded_file_names.add(persist_key("pair-1", "Top/b"))
+
+        with patch("controller.model_updater.os.path.exists", return_value=True):
+            updater._refresh_staged(pc, local_scan_arrived=False)
+
+        self.assertEqual({"Top/a", "Top/b"}, updater._staged_for(pc))
+
+    def test_a_name_that_left_staging_stays_staged_until_a_local_scan(self):
+        """Moved out, not yet rescanned: no local presence, but not deleted."""
+        pc = self._make_pc()
+        persist = self._persist("Top/a")
+        updater = self._make_updater(pc, persist)
+        with patch("controller.model_updater.os.path.exists", return_value=True):
+            updater._refresh_staged(pc, local_scan_arrived=True)
+        persist.downloaded_file_names.add(persist_key("pair-1", "Top/b"))
+
+        with patch("controller.model_updater.os.path.exists", return_value=False):
+            updater._refresh_staged(pc, local_scan_arrived=False)
+            self.assertEqual({"Top/a"}, updater._staged_for(pc))
+            updater._refresh_staged(pc, local_scan_arrived=True)
+            self.assertEqual(set(), updater._staged_for(pc))
+
+    def test_staging_off_stages_nothing(self):
+        pc = self._make_pc()
+        pc.effective_local_path = "/local"
+        updater = self._make_updater(pc, self._persist("Top/a"))
+
+        with patch("controller.model_updater.os.path.exists") as exists_mock:
+            updater._refresh_staged(pc, local_scan_arrived=True)
+
+        exists_mock.assert_not_called()
+        self.assertEqual(set(), updater._staged_for(pc))
 
 
 class TestRestartLeavesStoppedNestedPartialInStaging(unittest.TestCase):
@@ -1076,6 +1187,7 @@ class TestRestartLeavesStoppedNestedPartialInStaging(unittest.TestCase):
         top.state = ModelFile.State.DOWNLOADED
         top.remote_size = 20
 
+        updater._refresh_staged(pc, local_scan_arrived=True)
         updater._remember_staged_nested()
         with patch("controller.command_pipeline.MoveProcess") as move_cls:
             updater._process_model_diffs([ModelDiff(ModelDiff.Change.ADDED, None, top)])

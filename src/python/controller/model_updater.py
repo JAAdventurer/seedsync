@@ -24,7 +24,7 @@ from .exclude_patterns import filter_excluded_files
 from .extract import ExtractCompletedResult, ExtractFailedResult, ExtractProcess, ExtractStatus, ExtractStatusResult
 from .model_registry import ModelRegistry
 from .pair_context import PairContext
-from .persist_keys import persist_key, strip_persist_key
+from .persist_keys import bare_name, persist_key, strip_persist_key
 from .persist_sync import PersistSync
 from .scan.scanner_process import ScannerResult
 from .validate import (
@@ -84,6 +84,10 @@ class ModelUpdater:
         # (see _remember_staged_nested / _recover_staged_nested).
         self._staged_nested_remembered = False
         self._staged_nested_recovered = False
+        # Per pair: its nested persist names that are staged, and the names
+        # that set was computed from (see _refresh_staged).
+        self._staged: dict[str | None, set[str]] = {}
+        self._staged_from: dict[str | None, frozenset[str]] = {}
 
     def update(self) -> None:
         # Grab the latest extract results. Completed/failed go through the
@@ -99,11 +103,10 @@ class ModelUpdater:
         latest_validated_results = self._validate_process.pop_completed()
         latest_failed_validations = self._validate_process.pop_failed()
 
-        self._remember_staged_nested()
-
         # Process each pair context's scan results and LFTP status
         for pc in self._pair_contexts:
             self._update_pair_model_state(pc, latest_extract_statuses, latest_validate_statuses)
+        self._remember_staged_nested()
 
         self._process_extraction_completions(latest_extracted_results)
 
@@ -327,7 +330,7 @@ class ModelUpdater:
         absent_keys: set[str] = set()
         for pkey in self._persist.downloaded_file_names:
             # model_keys are top-level; nested keys are pruned below
-            if is_nested_name(pkey):
+            if is_nested_name(bare_name(pkey)):
                 continue
             if pkey not in model_keys and pkey not in self._pipeline.moved_file_keys:
                 absent_keys.add(pkey)
@@ -350,41 +353,48 @@ class ModelUpdater:
         absent_keys: set[str] = set()
         for pc in self._pair_contexts:
             for names in self._persist.all_sets().values():
-                for bare_name in self._persist_sync.names_for_pair(names, pc.pair_id):
-                    if not is_nested_name(bare_name) or self._is_staged(pc, bare_name):
+                for name in self._persist_sync.names_for_pair(names, pc.pair_id):
+                    if not is_nested_name(name) or name in self._staged_for(pc):
                         continue
                     try:
-                        self._registry.resolve_full_path(bare_name, pair_id=pc.pair_id)
+                        self._registry.resolve_full_path(name, pair_id=pc.pair_id)
                     except ModelError:
-                        absent_keys.add(persist_key(pc.pair_id, bare_name))
+                        absent_keys.add(persist_key(pc.pair_id, name))
         if absent_keys:
             self._logger.info(f"Persist cleanup (nested rows gone): {absent_keys}")
             for names in self._persist.all_sets().values():
                 names.difference_update(absent_keys)
             self.sync_persist_to_all_builders()
 
-    @staticmethod
-    def _in_staging(pc: PairContext, name: str) -> bool:
-        """True (staging on) if name is in the pair's staging dir."""
-        return pc.effective_local_path != pc.local_path and os.path.exists(os.path.join(pc.effective_local_path, name))
+    def _refresh_staged(self, pc: PairContext, local_scan_arrived: bool) -> None:
+        """Recompute which of this pair's nested persist names are staged: still
+        in its staging dir, or out of it (moved, or carried along by an
+        ancestor's move) since the last local scan. Those rows have no local
+        presence but aren't deleted.
 
-    @staticmethod
-    def _is_staged(pc: PairContext, name: str) -> bool:
-        """True (staging on) if name is still in the pair's staging dir, or was
-        just moved out of it and the local scan hasn't picked it up yet."""
-        return ModelUpdater._in_staging(pc, name) or (
-            pc.effective_local_path != pc.local_path and os.path.exists(os.path.join(pc.local_path, name))
-        )
-
-    def _staged_nested_names(self, pc: PairContext) -> set[str]:
-        """Nested downloaded names of this pair that are staged (see _is_staged)."""
+        Stats only when the pair's nested names change or a local scan arrives
+        (a finished move or delete forces one), not every cycle, so a slow
+        mount can't stall the controller loop (#811).
+        """
         if pc.effective_local_path == pc.local_path:
-            return set()
-        return {
+            return
+        names = frozenset(
             name
-            for name in self._persist_sync.names_for_pair(self._persist.downloaded_file_names, pc.pair_id)
-            if is_nested_name(name) and self._is_staged(pc, name)
-        }
+            for keys in self._persist.all_sets().values()
+            for name in self._persist_sync.names_for_pair(keys, pc.pair_id)
+            if is_nested_name(name)
+        )
+        prev = self._staged.get(pc.pair_id)
+        if prev is not None and not local_scan_arrived and names == self._staged_from[pc.pair_id]:
+            return
+        staged = {name for name in names if os.path.exists(os.path.join(pc.effective_local_path, name))}
+        if prev is not None and not local_scan_arrived:
+            staged |= prev & names
+        self._staged[pc.pair_id] = staged
+        self._staged_from[pc.pair_id] = names
+
+    def _staged_for(self, pc: PairContext) -> set[str]:
+        return self._staged.get(pc.pair_id, set())
 
     def _remember_staged_nested(self) -> None:
         """On the first cycle, list the nested downloads a restart left in
@@ -399,7 +409,7 @@ class ModelUpdater:
             return
         self._staged_nested_remembered = True
         for pc in self._pair_contexts:
-            pc.staged_nested.update(name for name in self._staged_nested_names(pc) if self._in_staging(pc, name))
+            pc.staged_nested.update(self._staged_for(pc))
 
     def _recover_staged_nested(self) -> None:
         """Move nested downloads a restart left in staging.
@@ -415,17 +425,20 @@ class ModelUpdater:
             return
         self._staged_nested_recovered = True
         for pc in self._pair_contexts:
-            for name in self._staged_nested_names(pc):
+            downloaded = self._persist_sync.names_for_pair(self._persist.downloaded_file_names, pc.pair_id)
+            for name in self._staged_for(pc) & downloaded:
                 # Skip one already moving, e.g. inside an ancestor's top-level move.
-                if not self._in_staging(pc, name) or self._pipeline.find_overlapping_move(name, pc):
+                if self._pipeline.find_overlapping_move(name, pc):
                     continue
                 try:
                     remote_size = self._registry.resolve_full_path(name, pair_id=pc.pair_id).remote_size
                 except ModelError:
+                    remote_size = None
+                if remote_size is None:
+                    self._logger.warning(f"Not moving '{name}' out of staging: its remote size is unknown")
                     continue
-                if remote_size is not None:
-                    self._logger.info(f"Moving '{name}' left in staging by a restart")
-                    self._pipeline.spawn_move_process(name, pc, expected_size=remote_size)
+                self._logger.info(f"Moving '{name}' left in staging by a restart")
+                self._pipeline.spawn_move_process(name, pc, expected_size=remote_size)
 
     def _process_extraction_failures(self, latest_failed_extractions: list[ExtractFailedResult]) -> None:
         """Process extraction failures -- mark as failed immediately."""
@@ -602,7 +615,8 @@ class ModelUpdater:
         pc.active_scanner.set_active_files(active_files)
 
         pc.model_builder.set_auto_delete_remote(bool(self._context.config.autoqueue.auto_delete_remote))
-        pc.model_builder.set_staged_files(self._staged_nested_names(pc))
+        self._refresh_staged(pc, latest_local_scan is not None and not latest_local_scan.failed)
+        pc.model_builder.set_staged_files(self._staged_for(pc))
 
         # Likewise keep the last good listing on a failed scan: an empty remote
         # list would prune persist records and later re-queue every download;
