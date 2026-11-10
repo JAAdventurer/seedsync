@@ -343,10 +343,10 @@ class TestSpawnNestedMoves(unittest.TestCase):
         pipeline.spawn_move_process.assert_not_called()
         self.assertEqual({"Top/leaf.rar"}, pc.pending_nested_moves)
 
-    def test_pending_nested_move_model_error_uses_none_expected_size(self):
+    def test_pending_nested_move_with_unresolvable_row_stays_in_staging(self):
         """The row can be gone by the time this runs (e.g. a remote delete
-        raced the completion); fall back to expected_size=None rather than
-        failing to spawn the move at all."""
+        raced the completion). Without a remote size a stopped partial can't be
+        told from a finished download, so nothing is moved."""
         pc = self._make_pair_context("pair-1")
         pc.pending_nested_moves = {"Top/leaf.rar"}
         updater, pipeline, registry = self._make_updater([pc], self._make_persist())
@@ -354,7 +354,18 @@ class TestSpawnNestedMoves(unittest.TestCase):
 
         updater._detect_lftp_completions(pc, [])
 
-        pipeline.spawn_move_process.assert_called_once_with("Top/leaf.rar", pc, expected_size=None)
+        pipeline.spawn_move_process.assert_not_called()
+        self.assertEqual(set(), pc.pending_nested_moves)
+
+    def test_pending_nested_move_with_no_remote_size_stays_in_staging(self):
+        pc = self._make_pair_context("pair-1")
+        pc.pending_nested_moves = {"Top/leaf.rar"}
+        updater, pipeline, registry = self._make_updater([pc], self._make_persist())
+        registry.resolve_full_path.return_value.remote_size = None
+
+        updater._detect_lftp_completions(pc, [])
+
+        pipeline.spawn_move_process.assert_not_called()
 
     def test_completion_without_pending_entry_spawns_nothing(self):
         """Only names queued under staging are moved: a nested job ending with

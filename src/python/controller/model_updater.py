@@ -600,6 +600,11 @@ class ModelUpdater:
                 expected_size = self._registry.resolve_full_path(name, pair_id=pc.pair_id).remote_size
             except ModelError:
                 expected_size = None
+            if expected_size is None:
+                # Without the remote size a Stop's partial can't be told from a
+                # finished download, so leave it in staging rather than move it.
+                self._logger.warning(f"Not moving '{name}' out of staging: its remote size is unknown")
+                continue
             self._pipeline.spawn_move_process(name, pc, expected_size=expected_size)
 
     def sync_persist_to_all_builders(self):

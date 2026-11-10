@@ -50,13 +50,12 @@ class MoveProcess(AppOneShotProcess):
         # When set, the moved tree is chmod'ed to 0666/0777 & ~umask here, in
         # this process, rather than on the controller thread (#811).
         self.__umask = umask
-        # Set for a nested job, whose move is triggered by its lftp job ending,
-        # which a Stop or an error also does. A smaller or unfinalized source
-        # was never completed, so it is left in staging for a re-queue to resume.
+        # When set, a source smaller than this or still holding lftp temp files
+        # is left in place, with no failure reported.
         self.__expected_size = expected_size
-        # For a top-level move: nested downloads under it that sit in staging
-        # ({path relative to file_name: remote size}). Any still incomplete
-        # stays in staging for its own job; complete ones move with the tree.
+        # {path relative to file_name: expected size} of descendants to check
+        # the same way; an incomplete one (or one of unknown size) is left in
+        # place while the rest of the tree moves.
         self.__nested_expected_sizes = nested_expected_sizes or {}
         self.__failed_result_stream = PipeStream()
 
